@@ -149,12 +149,14 @@ benchmark data: a 4K size table, insertion takes 83ns, deletion 125ns, lookup 7n
 */
 static DEFINE_SPINLOCK(datalock);
 static DEFINE_SPINLOCK(acklock);
+static DEFINE_SPINLOCK(tokenlock);
 
 /*TODO for production code, use resizable hashtable
 A technique related to IBM, https://lwn.net/Articles/612021/
 */
 static DEFINE_HASHTABLE(rcv_data_hashtbl, TBL_SIZE);
 static DEFINE_HASHTABLE(rcv_ack_hashtbl, TBL_SIZE);
+static DEFINE_HASHTABLE(token_key_hashtbl, TBL_SIZE);
 
 struct rcv_data {
     u64 key; //key of a flow, {LOW16(srcip), LOW16(dstip), tcpsrc, tcpdst}
@@ -192,6 +194,18 @@ struct rcv_ack {
 ///////////////////
 
 };
+
+struct token_key {
+    u32 token; //this is the actual key in token_key_hashtb;
+    u64 tcp_key64;    // master sk tcp_key64 calculated by get_tcp_key64(4 tuple)
+    u32 srcip; // master sk srcip
+    u32 dstip; // master sk dstip
+    u16 srcport; // master sk srcport
+    u16 dstport; // master sk dstprot
+    spinlock_t lock;
+    struct hlist_node hash;
+    struct rcu_head rcu;
+}
 
 /*rcv_data_hashtbl functions*/
 
@@ -323,10 +337,74 @@ static void rcv_ack_hashtbl_destroy(void)
     spin_unlock(&acklock);
 }
 
-//clear the 2 hash tables we added, used in module exit function
+
+
+/*functions for rcv_ack_hashtbl*/
+//insert a new entry
+static void token_key_hashtbl_insert(u32 token, struct token_key *value)
+{
+    u32 bucket_hash;
+    bucket_hash = ovs_hash_min((u64)token, HASH_BITS(token_key_hashtbl)); //hash_min is the same as hash_long if key is 64bit
+    //lock the table
+    spin_lock(&tokenlock);
+    hlist_add_head_rcu(&value->hash, &token_key_hashtbl[bucket_hash]);
+    spin_unlock(&tokenlock);
+}
+
+static void free_token_key_rcu(struct rcu_head *rp)
+{
+    struct token_key * tofree = container_of(rp, struct token_key, rcu);
+    kfree(tofree);
+}
+
+static void token_key_hashtbl_delete(struct token_key *value)
+{
+    //lock the table
+    spin_lock(&tokenlock);
+    hlist_del_init_rcu(&value->hash);
+    spin_unlock(&tokenlock);
+    call_rcu(&value->rcu, free_token_key_rcu);
+}
+
+//caller must use "rcu_read_lock()" to guard it
+static struct token_key * token_key_hashtbl_lookup(u32 token)
+{
+    int j = 0;
+    struct token_key * v_iter = NULL;
+
+
+    j = ovs_hash_min((u64)token), HASH_BITS(token_key_hashtbl));
+    hlist_for_each_entry_rcu(v_iter, &token_key_hashtbl[j], hash)
+    if (v_iter->token == token) /* iterm found*/
+        return v_iter;
+    return NULL; /*return NULL if can not find it */
+}
+
+//delete all entries in the hashtable
+static void token_key_hashtbl_destroy(void)
+{
+    struct token_key * v_iter;
+    struct hlist_node * tmp;
+    int j = 0;
+
+    rcu_barrier(); //wait until all rcu_call are finished
+
+    spin_lock(&tokenlock); //no new insertion or deletion !
+    hash_for_each_safe(token_key_hashtbl, j, tmp, v_iter, hash) {
+        hash_del(&v_iter->hash);
+        kfree(v_iter);
+        pr_info("delete one entry from token_key_hashtbl table\n");
+    }
+    spin_unlock(&tokenlock);
+}
+
+
+
+//clear the 3 hash tables we added, used in module exit function
 static void __hashtbl_exit(void) {
     rcv_data_hashtbl_destroy();
     rcv_ack_hashtbl_destroy();
+    token_key_hashtbl_destroy();
 }
 //rcv_data and rcv_ack hash table tests*/
 
@@ -1039,56 +1117,6 @@ static int ovs_unpack_ecn_info(struct sk_buff* skb, u32 * this_ecn, u32 * this_t
 
 /* Must be called with rcu_read_lock. */
 
-
-/////virtopia/////
-//caller must use "rcu_read_lock()" to guard it
-static struct rcv_ack * token_rcv_ack_hashtbl_lookup(u32 token)
-{
-    int j = 0;
-    struct rcv_ack * v_iter = NULL;
-
-
-    j = ovs_hash_min(token, HASH_BITS(rcv_ack_hashtbl));
-    hlist_for_each_entry_rcu(v_iter, &rcv_ack_hashtbl[j], hash)
-    if (v_iter->remote_token == token) /* iterm found*/
-        return v_iter;
-    return NULL; /*return NULL if can not find it */
-}
-//////////
-
-/////virtopia/////
-void mptcp_key_to_token(u64 key, u32 *token)
-{
-    u32 workspace[SHA_WORKSPACE_WORDS];
-    u32 mptcp_hashed_key[SHA_DIGEST_WORDS];
-    u8 input[64];
-    int i;
-
-    memset(workspace, 0, sizeof(workspace));
-
-    /* Initialize input with appropriate padding */
-    memset(&input[9], 0, sizeof(input) - 10); /* -10, because the last byte
-                           * is explicitly set too
-                           */
-    memcpy(input, &key, sizeof(key)); /* Copy key to the msg beginning */
-    input[8] = 0x80; /* Padding: First bit after message = 1 */
-    input[63] = 0x40; /* Padding: Length of the message = 64 bits */
-
-    sha_init(mptcp_hashed_key);
-    sha_transform(mptcp_hashed_key, input, workspace);
-
-    for (i = 0; i < 5; i++)
-        mptcp_hashed_key[i] = cpu_to_be32(mptcp_hashed_key[i]);
-
-    if (token)
-        *token = mptcp_hashed_key[0];
-//  if (idsn)
-//      *idsn = *((u64 *)&mptcp_hashed_key[3]);
-}
-//////////
-
-
-
 /* Must be called with rcu_read_lock. */
 void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
 {   
@@ -1216,37 +1244,36 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
                     mptcp_init_mp_opt(&mopt);
                     tcp_parse_mptcp_options(skb, &mopt);
 
-                    u64 sender_key;
+                    u64 sender_key; 
                     u64 receiver_key;
                     u32 *token = NULL;
 
                     sender_key = mopt.mptcp_sender_key;
                     receiver_key = mopt.mptcp_receiver_key;
                     token = mopt.mptcp_rem_token;
+
                     printk(KERN_INFO "[MPTCP SYN] %d --> %d\n, sender_key is %llu, receiver_key is %llu, token is %u", 
                         srcport, dstport, sender_key, receiver_key, *token);
-
-                    //wrong!
-                    //token = mptcp_find_join(skb);
 
 
                     if (token != NULL) {
                         rcu_read_lock();  
-                        // find entry from remote_token
-                        master_subflow_ack_entry  = token_rcv_ack_hashtbl_lookup(token);
+                        struct token_key *existing_token_key = NULL;
+                        existing_token_key = token_key_hashtbl_lookup(token);
                         rcu_read_unlock();
+
+                        if(existing_token_key != NULL) {
+                            struct rcv_ack *master_subflow_ack_entry = rcv_ack_hashtbl_lookup(existing_token_key->tcp_key64);
+                            //mutual key association
+                            if (master_subflow_ack_entry != NULL) {
+                                master_subflow_ack_entry -> peer_subflow_key = tcp_key64;
+                                new_entry-> peer_subflow_key = master_subflow_ack_entry->key;
+                            }
+                        }
+                    ////////////////////
                     }
 
-                    if(master_subflow_ack_entry  != NULL) {
-                        tcp_key64 = get_tcp_key64(srcip, dstip, srcport, dstport);
-                        //mutual key association
-                        master_subflow_ack_entry -> peer_subflow_key = tcp_key64;
-                        new_entry-> peer_subflow_key = master_subflow_ack_entry->key;
-                        
-                        //ack_entry2->iperf_server_key = master_subflow_ack_entry2->iperf_server_key;
-                        //ack_entry2->iperf_server_token = master_subflow_ack_entry2->iperf_server_token;
-                    }
-                    ////////////////////
+
 
                 }
                 //////////virtopia//////////
@@ -1260,22 +1287,39 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
                     rcu_read_unlock();
 
                     u32 *token;
-                    //wrong!
-                    //ack_entry->iperf_server_key = tcp_mptcp_parse_options(skb);
 
                     struct mptcp_options_received mopt;
                     mptcp_init_mp_opt(&mopt);
                     tcp_parse_mptcp_options(skb, &mopt);
 
-                    mptcp_key_to_token(mopt.mptcp_receiver_key, *token);
+                    u64 receiver_key;
 
-                    cur_entry->remote_token = token; 
+                    mptcp_key_sha1(mopt.mptcp_receiver_key, *token, NULL)
+
+                    cur_entry->remote_token = token;
+
                     printk(KERN_INFO "[MPTCP ACK] %d --> %d\n, receiver_key is %llu, calculated token is %u", 
                         srcport, dstport, mopt.mptcp_receiver_key, *token);
-                    //if(ack_entry->iperf_server_key != 0) {
-                    //    mptcp_key_sha1(ack_entry->iperf_server_key, *token);
-                    //    ack_entry->iperf_server_token = *token;
-                    //}
+
+
+
+
+                    struct token_key *new_token_key = NULL;
+
+                    rcu_read_lock();
+                    new_token_key = token_key_hashtbl_lookup(token);
+                    rcu_read_unlock();
+                    if (likely(!new_token_key)) {
+                        new_token_key = kzalloc(sizeof(*new_token_key), GFP_KERNEL);
+                        new_token_key->token = token;
+                        new_token_key->tcp_key64 = get_tcp_key(dstip, srcip, dstport, srcport);
+                        new_token_key->srcip = srcip;
+                        new_token_key->dstip = dscip;
+                        new_token_key->srcport = srcport;
+                        new_token_key->dstport = dstport;
+                        rcv_ack_hashtbl_insert(token, new_token_key);
+                    }
+
                 }
                 ////////////////////
 
