@@ -67,8 +67,8 @@
 #include <net/mptcp.h> // must be MPTCP Linux kernel 
 #include <net/tcp.h>  //must be MPTCP Linux kernel
 
-void tcp_parse_mptcp_options(const struct sk_buff *skb,
-                 struct mptcp_options_received *mopt);
+//void tcp_parse_mptcp_options(const struct sk_buff *skb,
+//                 struct mptcp_options_received *mopt);
 
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
@@ -76,7 +76,7 @@ void tcp_parse_mptcp_options(const struct sk_buff *skb,
 
 
 /*************************qiwei's logic************************/
-extern unsigned int queuelength;
+//extern unsigned int queuelength;
 unsigned int ecn_mark_threshold=10000;
 module_param(ecn_mark_threshold, uint, 0640);
 MODULE_PARM_DESC(ecn_mark_threshold, "the ecn_mark_threshold for htb_queue by bytes");
@@ -205,7 +205,7 @@ struct token_key {
     spinlock_t lock;
     struct hlist_node hash;
     struct rcu_head rcu;
-}
+};
 
 /*rcv_data_hashtbl functions*/
 
@@ -373,7 +373,7 @@ static struct token_key * token_key_hashtbl_lookup(u32 token)
     struct token_key * v_iter = NULL;
 
 
-    j = ovs_hash_min((u64)token), HASH_BITS(token_key_hashtbl));
+    j = ovs_hash_min((u64)token, HASH_BITS(token_key_hashtbl));
     hlist_for_each_entry_rcu(v_iter, &token_key_hashtbl[j], hash)
     if (v_iter->token == token) /* iterm found*/
         return v_iter;
@@ -1294,15 +1294,12 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
 
                     u64 receiver_key;
 
-                    mptcp_key_sha1(mopt.mptcp_receiver_key, *token, NULL)
+                    mptcp_key_sha1(mopt.mptcp_receiver_key, *token, NULL);
 
                     cur_entry->remote_token = token;
 
                     printk(KERN_INFO "[MPTCP ACK] %d --> %d\n, receiver_key is %llu, calculated token is %u", 
                         srcport, dstport, mopt.mptcp_receiver_key, *token);
-
-
-
 
                     struct token_key *new_token_key = NULL;
 
@@ -1312,9 +1309,9 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
                     if (likely(!new_token_key)) {
                         new_token_key = kzalloc(sizeof(*new_token_key), GFP_KERNEL);
                         new_token_key->token = token;
-                        new_token_key->tcp_key64 = get_tcp_key(dstip, srcip, dstport, srcport);
+                        new_token_key->tcp_key64 = get_tcp_key64(dstip, srcip, dstport, srcport);
                         new_token_key->srcip = srcip;
-                        new_token_key->dstip = dscip;
+                        new_token_key->dstip = dstip;
                         new_token_key->srcport = srcport;
                         new_token_key->dstport = dstport;
                         rcv_ack_hashtbl_insert(token, new_token_key);
@@ -1539,6 +1536,7 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
 			    }
 			    printk(KERN_INFO "current RWND is:%u.\n", ack_entry->rwnd);
 			    if ( (ntohs(tcp->window) << ack_entry->snd_wscale) > ack_entry->rwnd) {
+                                    //modify receiver window at the receivers ovs
                                     u16 enforce_win = ack_entry->rwnd >> ack_entry->snd_wscale;
                                     tcp->window = htons(enforce_win);
                             }
