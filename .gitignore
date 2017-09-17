@@ -65,6 +65,8 @@ Module.symvers
 TAGS
 cscope.*
 tags
+#?
+.tags
 _debian
 odp-netlink.h
 OvsDpInterface.h
@@ -76,3 +78,7 @@ testsuite.tmp.orig
 /Documentation/_build
 /.venv
 /cxx-check
+
+#virtopia
+/datapath/virtopia/
+mymake.sh
