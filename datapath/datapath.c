@@ -61,92 +61,19 @@
 #include "vport-internal_dev.h"
 #include "vport-netdev.h"
 
-
-/////////////////////////////////////////virtopia///////////////////////////////////////////////////////
+//////virtopia//////
+#include <linux/hashtable.h>
 #include <linux/cryptohash.h>
 #include <net/mptcp.h> // must be MPTCP Linux kernel 
 #include <net/tcp.h>  //must be MPTCP Linux kernel
 
-//void tcp_parse_mptcp_options(const struct sk_buff *skb,
-//                 struct mptcp_options_received *mopt);
+
+extern void tcp_parse_mptcp_options(const struct sk_buff *skb,
+                 struct mptcp_options_received *mopt);
+extern void mptcp_key_sha1(u64 key, u32 *token, u64 *idsn);
 
 
-//////////////////////////////////////////////////////////////////////////////////////////////////
-
-
-
-/*************************qiwei's logic************************/
-//extern unsigned int queuelength;
-unsigned int ecn_mark_threshold=10000;
-module_param(ecn_mark_threshold, uint, 0640);
-MODULE_PARM_DESC(ecn_mark_threshold, "the ecn_mark_threshold for htb_queue by bytes");
-EXPORT_SYMBOL(ecn_mark_threshold);
-
-unsigned int printk_count=10000;
-module_param(printk_count, uint, 0640);
-MODULE_PARM_DESC(printk_count, "the printk_count for htb_queue");
-EXPORT_SYMBOL(printk_count);
-
-
-/**************************************************************/
-
-/*************************************keqiang's logic**************************/
-//keqiang's logic
-#include <linux/hashtable.h>
-#include <net/tcp.h>
-
-//keqiang's logic
-#define BRIDGE_NAME "br0" //help determine the direction of a packet, when we move to container, we only compare first 2 char
-#define OVS_PACK_HEADROOM 32
-#define MSS_DEFAULT (1500U - 14U - 20U -20U)  //in bytes
-#define TBL_SIZE 15U
-#define RWND_INIT 10U*MSS
-
-#define RWND_MIN (MSS)
-//#define RWND_STEP (MSS/2 + MSS/4)
-#define RWND_STEP (MSS)
-
-/*RWND / RTT = Tput
-so RWND = Tput*RTT
-the max Tput possible we allow is 10Gbps and
-the max RTT we anticipate is 4 msec
-so RWND_CLAMP is defined as following
-the RWND_SSTHRESH is "RWND_CLAMP >> 1"
-*/
-#define RWND_CLAMP (10*1000*1000*4/8) //4 means the maximal latency expected (4 msec), in bytes
-#define RWND_SSTHRESH_INIT (RWND_CLAMP >> 1)
-#define DCTCP_ALPHA_INIT 1024U
-#define DCTCP_MAX_ALPHA  1024U
-/* customer logic added by keqiang */
-/*pass a kernel parameter to initialized threshold*/
-static unsigned int MSS = MSS_DEFAULT;
-module_param(MSS, uint, 0644);
-MODULE_PARM_DESC(MSS, "An unsigned int to initlize the MSS");
-
-static unsigned int TIMELY_ALPHA = 512;// TIMELY_ALPHA / 2^10 is float alpha
-module_param(TIMELY_ALPHA, uint, 0644);
-MODULE_PARM_DESC(TIMELY_ALPHA, "An unsigned int to initlize timely's alpha");
-
-static unsigned int TIMELY_BETA = 512;// TIMELY_BETA / 2^10 is float beta
-module_param(TIMELY_BETA, uint, 0644);
-MODULE_PARM_DESC(TIMELY_BETA, "An unsigned int to initlize timely's BETA");
-
-static unsigned int TIMELY_Qhigh = 20000;
-module_param(TIMELY_Qhigh, uint, 0644);
-MODULE_PARM_DESC(TIMELY_Qhigh, "An unsigned int to initlize timely's Qhigh");
-
-static unsigned int TIMELY_Qlow = 10000;
-module_param(TIMELY_Qlow, uint, 0644);
-MODULE_PARM_DESC(TIMELY_Qlow, "An unsigned int to initlize timely's Qlow");
-
-static unsigned int dctcp_shift_g __read_mostly = 4; /* g = 1/2^4 */
-module_param(dctcp_shift_g, uint, 0644);
-MODULE_PARM_DESC(dctcp_shift_g, "parameter g for updating dctcp_alpha");
-
-/*besides flow table, we need to add two new hash tables
-RCU enabled hash table, high performant hash table
-benchmark data: a 4K size table, insertion takes 83ns, deletion 125ns, lookup 7ns
-*/
+//hashtable lock
 static DEFINE_SPINLOCK(datalock);
 static DEFINE_SPINLOCK(acklock);
 static DEFINE_SPINLOCK(tokenlock);
@@ -154,9 +81,13 @@ static DEFINE_SPINLOCK(tokenlock);
 /*TODO for production code, use resizable hashtable
 A technique related to IBM, https://lwn.net/Articles/612021/
 */
+//hashtable
+#define TBL_SIZE 15U
 static DEFINE_HASHTABLE(rcv_data_hashtbl, TBL_SIZE);
 static DEFINE_HASHTABLE(rcv_ack_hashtbl, TBL_SIZE);
 static DEFINE_HASHTABLE(token_key_hashtbl, TBL_SIZE);
+
+#define BRIDGE_NAME "ovsbr*"
 
 struct rcv_data {
     u64 key; //key of a flow, {LOW16(srcip), LOW16(dstip), tcpsrc, tcpdst}
@@ -187,11 +118,10 @@ struct rcv_ack {
     spinlock_t lock;
     struct hlist_node hash;
     struct rcu_head rcu;
-//////virtopia///////////
+
     u64 receiver_key;
     u32 remote_token; 
     u64 peer_subflow_key;
-///////////////////
 
 };
 
@@ -399,22 +329,25 @@ static void token_key_hashtbl_destroy(void)
 }
 
 
-
 //clear the 3 hash tables we added, used in module exit function
 static void __hashtbl_exit(void) {
     rcv_data_hashtbl_destroy();
     rcv_ack_hashtbl_destroy();
     token_key_hashtbl_destroy();
 }
-//rcv_data and rcv_ack hash table tests*/
 
+
+
+//rcv_data, rcv_ack, token_key hash table tests*/
 static void __hashtable_test(void) {
     u64 i;
     u64 j;
     struct timeval tstart;
     struct timeval tend;
 
-    printk(KERN_INFO "start rcv_data/ack_hashtbl tests.\n");
+    printk(KERN_INFO "start hashtbl tests.\n");
+
+    /*rcv_data_hashtbl performance*/
     do_gettimeofday(&tstart);
     for (i = 0; i < (1 << TBL_SIZE); i ++) {
         struct rcv_data * value = NULL;
@@ -427,7 +360,7 @@ static void __hashtable_test(void) {
     printk("rcv_data_hashtbl insert time taken: %ld microseconds\n", 1000000 * (tend.tv_sec - tstart.tv_sec) +
            (tend.tv_usec - tstart.tv_usec) );
 
-    //Lookup performance
+
     do_gettimeofday(&tstart);
     for (i = 0; i < (1 << TBL_SIZE); i ++) {
         for (j = 0; j < (1 << TBL_SIZE); j ++) {
@@ -441,7 +374,7 @@ static void __hashtable_test(void) {
     printk("rcv_data_hashtbl lookup time taken: %ld microseconds\n", 1000000 * (tend.tv_sec - tstart.tv_sec) +
            (tend.tv_usec - tstart.tv_usec) );
 
-    //correctness check of lookup
+
     for (i = 0; i < (1 << TBL_SIZE); i ++) {
         struct rcv_data * value = NULL;
         rcu_read_lock();
@@ -454,7 +387,7 @@ static void __hashtable_test(void) {
         rcu_read_unlock();
     }
 
-    //delete performacne
+
     do_gettimeofday(&tstart);
     for (i = 0; i < (1 << TBL_SIZE); i ++) {
         struct rcv_data * value = NULL;
@@ -466,6 +399,8 @@ static void __hashtable_test(void) {
     do_gettimeofday(&tend);
     printk("rcv_data_hashtbl deletion time taken: %ld microseconds\n", 1000000 * (tend.tv_sec - tstart.tv_sec) +
            (tend.tv_usec - tstart.tv_usec) );
+
+
 
     /*rcv_ack_hashtbl performance*/
     do_gettimeofday(&tstart);
@@ -520,14 +455,68 @@ static void __hashtable_test(void) {
     printk("rcv_ack_hashtbl deletion time taken: %ld microseconds\n", 1000000 * (tend.tv_sec - tstart.tv_sec) +
            (tend.tv_usec - tstart.tv_usec) );
 
-    printk(KERN_INFO "end rcv_data/ack_hashtbl tests.\n");
-}
-/* end of kqiang's logic*/
-/******************************************************************************/
 
-//int ovs_net_id __read_mostly;
+    
+    /*token_key_hashtbl performance*/
+    do_gettimeofday(&tstart);
+    for (i = 0; i < (1 << TBL_SIZE); i ++) {
+        struct token_key * value = NULL;
+        value = kzalloc(sizeof(*value), GFP_KERNEL);
+        value->token = i;
+        token_key_hashtbl_insert(i, value);
+    }
+
+    do_gettimeofday(&tend);
+    printk("token_key_hashtbl insert time taken: %ld microseconds\n", 1000000 * (tend.tv_sec - tstart.tv_sec) +
+           (tend.tv_usec - tstart.tv_usec) );
+
+    //Lookup performance
+    do_gettimeofday(&tstart);
+    for (i = 0; i < (1 << TBL_SIZE); i ++) {
+        for (j = 0; j < (1 << TBL_SIZE); j ++) {
+            struct token_key * value = NULL;
+            rcu_read_lock();
+            value = token_key_hashtbl_lookup(j);
+            rcu_read_unlock();
+        }
+    }
+    do_gettimeofday(&tend);
+    printk("token_key_hashtbl lookup time taken: %ld microseconds\n", 1000000 * (tend.tv_sec - tstart.tv_sec) +
+           (tend.tv_usec - tstart.tv_usec) );
+
+    //correctness check of lookup
+    for (i = 0; i < (1 << TBL_SIZE); i ++) {
+        struct token_key * value = NULL;
+        rcu_read_lock();
+        value = token_key_hashtbl_lookup(i);
+        if (value)
+            ;
+        //printk("lookup okay, value->key:%lu\n", value->key);
+        else
+            printk("token_key_hashtbl lookup bad!\n");
+        rcu_read_unlock();
+    }
+
+    //delete performacne
+    do_gettimeofday(&tstart);
+    for (i = 0; i < (1 << TBL_SIZE); i ++) {
+        struct token_key * value = NULL;
+        rcu_read_lock();
+        value = token_key_hashtbl_lookup(i);
+        rcu_read_unlock();
+        token_key_hashtbl_delete(value);
+    }
+    do_gettimeofday(&tend);
+    printk("token_key_hashtbl deletion time taken: %ld microseconds\n", 1000000 * (tend.tv_sec - tstart.tv_sec) +
+           (tend.tv_usec - tstart.tv_usec) );
+
+
+
+    printk(KERN_INFO "end hashtbl tests.\n");
+}
+
+
 unsigned int ovs_net_id __read_mostly;
-EXPORT_SYMBOL_GPL(ovs_net_id);
 
 static struct genl_family dp_packet_genl_family;
 static struct genl_family dp_flow_genl_family;
@@ -600,7 +589,6 @@ int lockdep_ovsl_is_held(void)
 	else
 		return 1;
 }
-EXPORT_SYMBOL_GPL(lockdep_ovsl_is_held);
 #endif
 
 static int queue_gso_packets(struct datapath *dp, struct sk_buff *,
@@ -720,102 +708,9 @@ void ovs_dp_detach_port(struct vport *p)
 
 	/* Then destroy it. */
 	ovs_vport_del(p);
-
-}
-/****************************************keqiang's logic**************************************/
-/* keqiang's logic */
-enum {
-    OVS_PKT_IN = 1U, //packets come to the host
-    OVS_PKT_OUT = 3U, //packets go to the network (switch), see "ip_summed_*"
-};
-
-enum {
-    OVS_ECN_MASK = 3U,
-    OVS_ECN_ZERO = 0U,
-    OVS_ECN_ONE = 1U,
-    OVS_ECN_FAKE = 4U, //set the second highest bit of 3 reserved bits in TCP header
-    OVS_ECN_FAKE_CLEAR = 11U, // 1011 (binary) = 11 (decimal)
-    OVS_ACK_SPEC_SET = 8U, //set the highest bit of 3 reserved bits in TCP header
-    OVS_ACK_PACK_SET = 2U, //set the third highest bit of 3 reserved bits in TCP header
-    OVS_ACK_PACK_CLEAR = 13U, // 1101 (binary) = 13 (decimal)
-};
-
-/*the following functions are used to copy part of an SKB, it is used to generate the ECN info ACKs
-we do not want to copy data of an skb, we just need the necessary MAC IP AND TCP headers
-This optimization is useful when DATA packets carry ACKs, for pure ACKs, it copies the whole ACK
-*/
-
-//need several functions from  <linux/net/core/skbuff.c>
-static inline int skb_alloc_rx_flag(const struct sk_buff *skb)
-{
-    if (skb_pfmemalloc(skb))
-        return SKB_ALLOC_RX;
-    return 0;
 }
 
-static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
-{
-    new->tstamp             = old->tstamp;
-    new->dev                = old->dev;
-    new->transport_header   = old->transport_header;
-    new->network_header     = old->network_header;
-    new->mac_header         = old->mac_header;
-    new->inner_protocol     = old->inner_protocol;
-    new->inner_transport_header = old->inner_transport_header;
-    new->inner_network_header = old->inner_network_header;
-    new->inner_mac_header = old->inner_mac_header;
-    skb_dst_copy(new, old);
-    skb_copy_hash(new, old);
-    new->ooo_okay           = old->ooo_okay;
-    new->no_fcs             = old->no_fcs;
-    new->encapsulation      = old->encapsulation;
-    memcpy(new->cb, old->cb, sizeof(old->cb));
-    new->csum               = old->csum;
-    //new->local_df           = old->local_df;
-    new->pkt_type           = old->pkt_type;
-    new->ip_summed          = old->ip_summed;
-    skb_copy_queue_mapping(new, old);
-    new->priority           = old->priority;
-    new->pfmemalloc         = old->pfmemalloc;
-    new->protocol           = old->protocol;
-    new->mark               = old->mark;
-    new->skb_iif            = old->skb_iif;
-    //__nf_copy(new, old);
 
-    new->vlan_proto         = old->vlan_proto;
-    new->vlan_tci           = old->vlan_tci;
-
-    skb_copy_secmark(new, old);
-
-}
-
-/*
-static void copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
-{
-    __copy_skb_header(new, old);
-
-    skb_shinfo(new)->gso_size = skb_shinfo(old)->gso_size;
-    skb_shinfo(new)->gso_segs = skb_shinfo(old)->gso_segs;
-    skb_shinfo(new)->gso_type = skb_shinfo(old)->gso_type;
-}
-*/
-
-static struct sk_buff *skb_copy_ecn_ack(const struct sk_buff *skb, gfp_t gfp_mask, u32 nondata_len) {
-    int headerlen = skb_headroom(skb);
-    unsigned int size = skb_end_offset(skb) + 0;
-    struct sk_buff *n = __alloc_skb(size, gfp_mask,
-                                    skb_alloc_rx_flag(skb), NUMA_NO_NODE);
-    if (!n)
-        return NULL;
-    /* Set the data pointer */
-    skb_reserve(n, headerlen);
-    /* Set the tail pointer and length */
-    skb_put(n, nondata_len);
-    if (skb_copy_bits(skb, -headerlen, n->head, headerlen + nondata_len))
-        BUG();
-    copy_skb_header(n, skb);
-    return n;
-}
 
 /*help function get a u64 key for a TCP flow */
 static u64 get_tcp_key64(u32 ip1, u32 ip2, u16 tp1, u16 tp2) {
@@ -839,11 +734,12 @@ static u64 get_tcp_key64(u32 ip1, u32 ip2, u16 tp1, u16 tp2) {
 
 /*helper function, determine the direction of the traffic (packet), i.e., go to the net or come to the host?*/
 static bool ovs_packet_to_net(struct sk_buff *skb) {
-    if (strncmp(skb->dev->name, BRIDGE_NAME, 2) == 0)
+    if (strncmp(skb->dev->name, BRIDGE_NAME, 5) == 0 )
         return 1;
     else
         return 0;
 }
+
 
 /*extract window scaling factor, Normally only called on SYN and SYNACK packets.
 see http://packetlife.net/blog/2010/aug/4/tcp-windows-and-window-scaling/
@@ -896,285 +792,32 @@ static u8 ovs_tcp_parse_options(const struct sk_buff *skb) {
     return snd_wscale;
 }
 
-/*keqiang's congestion control logic */
 
-static void ovs_tcp_slow_start(struct rcv_ack * rack, u32 acked) {
-//”acked” means the number of bytes acked by an ACK
-    u32 rwnd = rack->rwnd + acked;
 
-    if (rwnd > rack->rwnd_ssthresh)
-        rwnd = rack->rwnd_ssthresh + RWND_STEP;
-
-    rack->rwnd = min(rwnd, rack->rwnd_clamp);
-}
-
-/* In theory this is tp->snd_cwnd += 1 / tp->snd_cwnd (or alternative w) */
-/* In theory this is tp->rwnd += MSS / tp->rwnd (or alternative w) */
-static void ovs_tcp_cong_avoid_ai(struct rcv_ack * rack, u32 w, u32 acked) {
-    if (rack->snd_rwnd_cnt >= w) {
-        if (rack->rwnd < rack->rwnd_clamp)
-            rack->rwnd += RWND_STEP;
-        rack->snd_rwnd_cnt = 0;
-    } else {
-        rack->snd_rwnd_cnt += acked;
-    }
-
-    rack->rwnd = min(rack->rwnd, rack->rwnd_clamp);
-}
-
-/*
-* TCP Reno congestion control
-* This is special case used for fallback as well.
-*/
-/* This is Jacobson's slow start and congestion avoidance.
-* SIGCOMM '88, p. 328.
-*/
-static void ovs_tcp_reno_cong_avoid(struct rcv_ack * rack, u32 acked) {
-    /* In "safe" area, increase. */
-    if (rack->rwnd <= rack->rwnd_ssthresh)
-        ovs_tcp_slow_start(rack, acked);
-    /* In dangerous area, increase slowly. */
-    else
-        ovs_tcp_cong_avoid_ai(rack, rack->rwnd, acked);
-}
-
-/* Slow start threshold is half the congestion window (min 2) */
-static u32 ovs_tcp_reno_ssthresh(struct rcv_ack* rack) {
-    return max(rack->rwnd >> 1U, 2U);
-}
-
-static void ovs_dctcp_reset(struct rcv_ack * rack) {
-    rack->next_seq = rack->snd_nxt;
-
-    rack->ecn_bytes = 0;
-    rack->total_bytes = 0;
-
-    rack->reduced_this_win = false;
-    rack->loss_detected_this_win = false;
-}
-
-static u32 ovs_dctcp_ssthresh(struct rcv_ack * rack) {
-    //cwnd = cwnd* (1 - alpha/2)
-    //rwnd = rwnd* (1 - alpha/2)
-    return max(rack->rwnd - ((rack->rwnd * rack->alpha) >> 11U), RWND_MIN);
-
-}
-
-static void ovs_dctcp_update_alpha(struct rcv_ack * rack) {
-    /* Expired RTT */
-    /* update alpha once per window of data, roughly once per RTT
-     * rack->total_bytes should be larger than 0
-     */
-    if (!before(rack->snd_una, rack->next_seq)) {
-
-        /*printk(KERN_INFO "ecn_bytes:%u, total_bytes:%u, alpha:%u, snd_una:%u, next_seq:%u, snd_nxt:%u \n",
-                *         rack->ecn_bytes, rack->total_bytes, rack->alpha, rack->snd_una, rack->next_seq, rack->snd_nxt);
-        */
-        /* keep alpha the same if total_bytes is zero */
-        if (rack->total_bytes > 0) {
-
-            if (rack->ecn_bytes > rack->total_bytes)
-                rack->ecn_bytes = rack->total_bytes;
-
-            /* alpha = (1 - g) * alpha + g * F */
-            rack->alpha = rack->alpha -
-                          (rack->alpha >> dctcp_shift_g) +
-                          (rack->ecn_bytes << (10U - dctcp_shift_g)) /
-                          rack->total_bytes;
-            if (rack->alpha > DCTCP_MAX_ALPHA)
-                rack->alpha = DCTCP_MAX_ALPHA;
-        }
-
-        ovs_dctcp_reset(rack);
-        /*printk(KERN_INFO "ecn_bytes:%u, total_bytes:%u, alpha:%u\n",
-                        rack->ecn_bytes, rack->total_bytes, rack->alpha);
-        */
-
-    }
-}
-
-static bool ovs_may_raise_rwnd(struct rcv_ack * rack) {
-    /*return ture if there is no ECN feedback received in this window yet &&
-    * no packet loss is detected in this window yet
-    */
-    if (rack->ecn_bytes > 0 || rack->loss_detected_this_win == true)
-        return false;
-    else
-        return true;
-}
-
-static bool ovs_may_reduce_rwnd(struct rcv_ack * rack) {
-    if (rack->reduced_this_win == false)
-        return true;
-    else
-        return false;
-}
-static int ovs_pack_ecn_info(struct sk_buff * skb, u32 ecn_bytes, u32 total_bytes) {
-    struct iphdr *nh;
-    struct tcphdr * tcp;
-
-    u16 header_len;
-    u16 old_total_len;
-    u16 old_tcp_len;
-
-    u8 ECN_INFO_LEN = 8;
-    /*the caller makes sure this is a TCP packet*/
-    nh = ip_hdr(skb);
-    tcp = tcp_hdr(skb);
-
-    header_len = skb->mac_len + (nh->ihl << 2) + 20;
-    old_total_len = ntohs(nh->tot_len);
-    old_tcp_len = tcp->doff << 2;
-
-    if (skb_cow_head(skb, ECN_INFO_LEN) < 0)
-        return -ENOMEM;
-
-    skb_push(skb, ECN_INFO_LEN);
-    memmove(skb_mac_header(skb) - ECN_INFO_LEN, skb_mac_header(skb), header_len);
-    skb_reset_mac_header(skb);
-    skb_set_network_header(skb, skb->mac_len);
-    skb_set_transport_header(skb, skb->mac_len + (ip_hdr(skb)->ihl << 2));
-
-    ecn_bytes = htonl(ecn_bytes);
-    total_bytes = htonl(total_bytes);
-    memcpy(skb_mac_header(skb) + header_len, &ecn_bytes, (ECN_INFO_LEN >> 1));
-    memcpy(skb_mac_header(skb) + header_len + (ECN_INFO_LEN >> 1), &total_bytes, (ECN_INFO_LEN >> 1));
-    /*we believe that the NIC will re-calculate checksums for us*/
-    nh = ip_hdr(skb);
-    tcp = tcp_hdr(skb);
-
-    nh->tot_len = htons(old_total_len + ECN_INFO_LEN);
-    tcp->doff = ((old_tcp_len + ECN_INFO_LEN) >> 2);
-    /*printk("before maring pack, tcp->src:%u, tcp->dst:%u, tcp->res1:%u\n",
-    * ntohs(tcp->source), ntohs(tcp->dest), tcp->res1);
-    */
-    tcp->res1 |= OVS_ACK_PACK_SET;
-    /*printk("before maring pack, tcp->src:%u, tcp->dst:%u, tcp->res1:%u\n",
-    * ntohs(tcp->source), ntohs(tcp->dest), tcp->res1);
-    */
-    return 0;
-}
-
-/*note, after this unpack function, tcp and ip points should be refreshed*/
-static int ovs_unpack_ecn_info(struct sk_buff* skb, u32 * this_ecn, u32 * this_total) {
-    struct iphdr *nh;
-    struct tcphdr * tcp;
-
-    u16 header_len;
-    u16 old_total_len;
-    u16 old_tcp_len;
-    int err;
-
-    u8 ECN_INFO_LEN = 8;
-    /*the caller makes sure this is a TCP packet*/
-    nh = ip_hdr(skb);
-    tcp = tcp_hdr(skb);
-
-    header_len = skb->mac_len + (nh->ihl << 2) + 20;
-    old_total_len = ntohs(nh->tot_len);
-    old_tcp_len = tcp->doff << 2;
-
-    err = skb_ensure_writable(skb, header_len);
-    if (unlikely(err))
-        return err;
-
-    memset(this_ecn, 0, sizeof(*this_ecn));
-    memset(this_total, 0, sizeof(*this_total));
-
-    memcpy(this_ecn, skb_mac_header(skb) + header_len, (ECN_INFO_LEN >> 1));
-    memcpy(this_total, skb_mac_header(skb) + header_len + (ECN_INFO_LEN >> 1), (ECN_INFO_LEN >> 1));
-
-    *this_ecn = ntohl(*this_ecn);
-    *this_total = ntohl(*this_total);
-
-    //printk("we are unpack (check ip_summed):%u, ip_fast_csum:%u\n", skb->ip_summed, ip_fast_csum((u8 *)nh, nh->ihl));
-    skb_postpull_rcsum(skb, skb_mac_header(skb) + header_len, ECN_INFO_LEN);
-
-    memmove(skb_mac_header(skb) + ECN_INFO_LEN, skb_mac_header(skb), header_len);
-    __skb_pull(skb, ECN_INFO_LEN);
-    skb_reset_mac_header(skb);
-    skb_set_network_header(skb, skb->mac_len);
-    skb_set_transport_header(skb, skb->mac_len + (ip_hdr(skb)->ihl << 2));
-
-    nh = ip_hdr(skb);
-    tcp = tcp_hdr(skb);
-
-    /*printk("we are unpack (before), tcp->src:%u, tcp->dst:%u, tcp->seq:%u, tcp->ack_seq:%u, tcp->res1:%u, nh->tot_len:%u, tcp->doff:%u, this_ecn:%u, this_total:%u, skb->ip_summed:%u\n",
-        * ntohs(tcp->source), ntohs(tcp->dest), ntohl(tcp->seq), ntohl(tcp->ack_seq), tcp->res1, ntohs(nh->tot_len), tcp->doff, *this_ecn, *this_total, skb->ip_summed);
-    */
-    nh->tot_len = htons(old_total_len - ECN_INFO_LEN);
-    csum_replace2(&nh->check, htons(old_total_len), nh->tot_len);
-
-    tcp->doff = ((old_tcp_len - ECN_INFO_LEN) >> 2);
-    tcp->res1 &= OVS_ACK_PACK_CLEAR;
-
-    /*printk("we are unpack (after), tcp->src:%u, tcp->dst:%u, tcp->seq:%u, tcp->ack_seq:%u, tcp->res1:%u, nh->tot_len:%u, tcp->doff:%u, this_ecn:%u, this_total:%u, skb->ip_summed:%u, ip_fast_csum:%u\n",
-        * ntohs(tcp->source), ntohs(tcp->dest), ntohl(tcp->seq), ntohl(tcp->ack_seq), tcp->res1, ntohs(nh->tot_len), tcp->doff, *this_ecn, *this_total, skb->ip_summed, ip_fast_csum((u8 *)nh, nh->ihl));
-    */
-    return 0;
-}
-/***********************************************************************************/
-
-/* Must be called with rcu_read_lock. */
 
 /* Must be called with rcu_read_lock. */
 void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
-{   
-    const struct vport *p = OVS_CB(skb)->input_vport;
-    struct datapath *dp = p->dp;
-    struct sw_flow *flow;
-    struct sw_flow_actions *sf_acts;
-    struct dp_stats_percpu *stats;
-    u64 *stats_counter;
-    u32 n_mask_hit;
-    // for timely-like congestion control
-    static unsigned long prev_qlen = 0;
-    long new_qlen_diff;
-    static long qlen_diff = 0;
-    long normalized_gradient;
-    unsigned long new_qlen;
+{
+	printk(KERN_INFO "in proc packet");
+	const struct vport *p = OVS_CB(skb)->input_vport;
+	struct datapath *dp = p->dp;
+	struct sw_flow *flow;
+	struct sw_flow_actions *sf_acts;
+	struct dp_stats_percpu *stats;
+	u64 *stats_counter;
+	u32 n_mask_hit;
 
-    stats = this_cpu_ptr(dp->stats_percpu);
-   
-    /**************************************keqiang's logic-one***********************/ 
+	stats = this_cpu_ptr(dp->stats_percpu);
+
+//////virtopia//////
     struct iphdr *nh = NULL;
-    struct tcphdr * tcp = NULL;
-    /*
-    if(queuelength > ecn_mark_threshold) {
-            if(ntohs(skb->protocol) == ETH_P_IP) {
-                nh = ip_hdr(skb);
-                //printk(KERN_INFO "nh = ip_hdr(skb)");
-                if(nh->protocol == IPPROTO_TCP) {
-                    if (ovs_packet_to_net(skb)) {
-                        ipv4_change_dsfield(nh, 0, 3);
-                        if(count_printk>printk_count){
-                            printk(KERN_ALERT "it is tcp and be changed \n");
-                        }
-                    }
-                }//it was an TCP packet
-            }//it was an IP packet
-     }*/
-     new_qlen = (unsigned long)queuelength;
-     new_qlen_diff = new_qlen - prev_qlen;
-     qlen_diff = ((1024-TIMELY_ALPHA) * qlen_diff + TIMELY_ALPHA * new_qlen_diff) / 1024;	
-     normalized_gradient = qlen_diff*1024 / TIMELY_Qlow;//scaled by 1024Us
-
-     printk(KERN_INFO "new_qlen:%lu, prev_qlen:%lu, qlen_diff:%ld, gradient:%ld \n", new_qlen, prev_qlen, qlen_diff, normalized_gradient);
-     prev_qlen = new_qlen;
-    /*keqiang's marking, speically for SYN*/
-    /*here we assume that user won't use TOS field, in other words,
-    it is always 0. For producation code, this can be solved by adding
-    a few more lines of code
-    */
-    /*keqiang's logic,
-    TODO: we assume that TCP three-way hand-shake is always successful
-    while in production code, this should be taken care, broken handshake waste entries in the hashtables
-    this piece of logic should be before "upcall" because we need to examine SYN
-    */
-    
+    struct tcphdr *tcp = NULL;
     if (ntohs(skb->protocol) == ETH_P_IP) { //this is an IP packet
-        nh = ip_hdr(skb);
+        printk(KERN_INFO "skb->protocol == ETH_P_IP ok");
+        nh = ip_hdr(skb);  // in <linux/ip.h> 
+        printk(KERN_INFO "nh->protocol: %u IPPROTO_TCP: %u", nh->protocol, IPPROTO_TCP);
         if (nh->protocol == IPPROTO_TCP) { //this is an TCP packet
+            printk(KERN_INFO "nh->protocol == IPPROTO_TCP ok");
             u32 srcip;
             u32 dstip;
             u16 srcport;
@@ -1187,62 +830,17 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
             dstip = ntohl(nh->daddr);
             srcport = ntohs(tcp->source);
             dstport = ntohs(tcp->dest);
+	        printk(KERN_INFO "sip %u dip %u spt %u dpt %u", srcip, dstip, srcport, dstport);
 
-            //outgoing SYN or SYN/ACK or FIN, insert/delete entry in rcv_ack_hashtbl
             if (ovs_packet_to_net(skb)) {
-                if (unlikely(tcp->syn)) {//insert an entry to rcv_ack_hashtbl
-                    struct rcv_ack * new_entry = NULL;
-                    //pay attention to the parameter order
-                    tcp_key64 = get_tcp_key64(dstip, srcip, dstport, srcport);
-
-                    rcu_read_lock();
-                    new_entry = rcv_ack_hashtbl_lookup(tcp_key64);
-                    rcu_read_unlock();
-                    if (likely(!new_entry)) {
-                        new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
-                        new_entry->key = tcp_key64;
-                        rcv_ack_hashtbl_insert(tcp_key64, new_entry);
-                    }
-
-                    new_entry->rwnd = RWND_INIT;
-                    new_entry->rwnd_ssthresh = RWND_SSTHRESH_INIT;
-                    new_entry->rwnd_clamp = RWND_CLAMP;
-                    new_entry->alpha = DCTCP_ALPHA_INIT;
-                    new_entry->snd_una = ntohl(tcp->seq);
-                    new_entry->snd_nxt = ntohl(tcp->seq) + 1;//SYN takes 1 byte
-                    new_entry->next_seq = new_entry->snd_nxt;
-                    //keqiang, Sep 19, 2015, Window Scaling factor logic was wrong
-                    //new_entry->snd_wscale = ovs_tcp_parse_options(skb);
-                    new_entry->snd_rwnd_cnt = 0;
-                    new_entry->reduced_this_win = false;
-                    new_entry->loss_detected_this_win = false;
-                    new_entry->prior_real_rcv_wnd = ntohs(tcp->window);
-                    new_entry->dupack_cnt = 0;
-                    new_entry->ecn_bytes = 0;
-                    new_entry->total_bytes = 0;
-
-                    //////////virtopia//////////
-                    //////////SYN//////////
-                    new_entry->receiver_key=0;
-                    new_entry->remote_token=0; 
-                    new_entry->peer_subflow_key=0;
-                    ////// 
-
-                    spin_lock_init(&new_entry->lock);
-
-                    printk(KERN_INFO "rcv_ack_hashtbl new entry inserted. %d --> %d, snd_rwnd_cnt:%u, rwnd:%u \n",
-                                srcport, dstport,
-                                new_entry->snd_rwnd_cnt, new_entry->rwnd);
-                    
-
-                    //////////virtopia//////////
-                    //////////SYN + MP_JOIN(remote_token, R_client)//////////
-                    struct rcv_ack *master_subflow_ack_entry = NULL; 
-
-
+                if (unlikely(tcp->syn)) {
+                    printk(KERN_INFO "syn");
                     struct mptcp_options_received mopt;
+                    printk(KERN_INFO "syn: struct mptcp_options_received mopt;");
                     mptcp_init_mp_opt(&mopt);
+                    printk(KERN_INFO "syn: mptcp_init_mp_opt(&mopt);");
                     tcp_parse_mptcp_options(skb, &mopt);
+                    printk(KERN_INFO "syn: tcp_parse_mptcp_options(skb, &mopt);");
 
                     u64 sender_key; 
                     u64 receiver_key;
@@ -1254,319 +852,69 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
 
                     printk(KERN_INFO "[MPTCP SYN] %d --> %d\n, sender_key is %llu, receiver_key is %llu, token is %u", 
                         srcport, dstport, sender_key, receiver_key, *token);
-
-
-                    if (token != NULL) {
-                        rcu_read_lock();  
-                        struct token_key *existing_token_key = NULL;
-                        existing_token_key = token_key_hashtbl_lookup(token);
-                        rcu_read_unlock();
-
-                        if(existing_token_key != NULL) {
-                            struct rcv_ack *master_subflow_ack_entry = rcv_ack_hashtbl_lookup(existing_token_key->tcp_key64);
-                            //mutual key association
-                            if (master_subflow_ack_entry != NULL) {
-                                master_subflow_ack_entry -> peer_subflow_key = tcp_key64;
-                                new_entry-> peer_subflow_key = master_subflow_ack_entry->key;
-                            }
-                        }
-                    ////////////////////
-                    }
-
-
-
                 }
-                //////////virtopia//////////
-                //////////ACK + MP_CAPABLE(sender_key, receiver_key)
+
+
                 if (unlikely(tcp->ack)) {
-                    //outgoing ack
-                    struct rcv_ack *cur_entry = NULL;
-                    tcp_key64 = get_tcp_key64(dstip, srcip, dstport, srcport);
-                    rcu_read_lock();
-                    cur_entry = rcv_ack_hashtbl_lookup(tcp_key64);
-                    rcu_read_unlock();
-
-                    u32 *token;
-
+                    u32 *token;                    
+                    printk(KERN_INFO "ack");
                     struct mptcp_options_received mopt;
+                    printk(KERN_INFO "ack: struct mptcp_options_received mopt;");
                     mptcp_init_mp_opt(&mopt);
+                    printk(KERN_INFO "ack: mptcp_init_mp_opt(&mopt);");
                     tcp_parse_mptcp_options(skb, &mopt);
-
+                    printk(KERN_INFO "ack: tcp_parse_mptcp_options(skb, &mopt);");
                     u64 receiver_key;
-
-                    mptcp_key_sha1(mopt.mptcp_receiver_key, *token, NULL);
-
-                    cur_entry->remote_token = token;
-
+                    mptcp_key_sha1(mopt.mptcp_receiver_key, token, NULL);
+                    printk(KERN_INFO "ack: tcp_parse_mptcp_options(skb, &mopt);");
                     printk(KERN_INFO "[MPTCP ACK] %d --> %d\n, receiver_key is %llu, calculated token is %u", 
                         srcport, dstport, mopt.mptcp_receiver_key, *token);
-
-                    struct token_key *new_token_key = NULL;
-
-                    rcu_read_lock();
-                    new_token_key = token_key_hashtbl_lookup(token);
-                    rcu_read_unlock();
-                    if (likely(!new_token_key)) {
-                        new_token_key = kzalloc(sizeof(*new_token_key), GFP_KERNEL);
-                        new_token_key->token = token;
-                        new_token_key->tcp_key64 = get_tcp_key64(dstip, srcip, dstport, srcport);
-                        new_token_key->srcip = srcip;
-                        new_token_key->dstip = dstip;
-                        new_token_key->srcport = srcport;
-                        new_token_key->dstport = dstport;
-                        rcv_ack_hashtbl_insert(token, new_token_key);
-                    }
-
                 }
-                ////////////////////
-
-                /*TODO: we may also need to consider RST */
-                if (unlikely(tcp->fin)) {
-                    struct rcv_ack * new_entry = NULL;
-                    //pay attention to the parameter order
-                    tcp_key64 = get_tcp_key64(dstip, srcip, dstport, srcport);
-
-                    rcu_read_lock();
-                    new_entry = rcv_ack_hashtbl_lookup(tcp_key64);
-                    rcu_read_unlock();
-                    if (likely(new_entry)) {
-                        rcv_ack_hashtbl_delete(new_entry);
-                        printk(KERN_INFO "rcv_ack_hashtbl new entry deleted. %d --> %d\n",
-                            srcport, dstport);
-                        
-                    }
-
-                }
-
-            }//it was outgoing
-            else { //incoming traffic
-                if (unlikely(tcp->syn)) {
-                    struct rcv_data * new_entry = NULL;
-                    struct rcv_ack * ack_entry2 = NULL;
-                    //pay attention to the parameter order
-                    tcp_key64 = get_tcp_key64(srcip, dstip, srcport, dstport);
-
-                    rcu_read_lock();
-                    new_entry = rcv_data_hashtbl_lookup(tcp_key64);
-                    rcu_read_unlock();
-                    if (likely(!new_entry)) {
-                        new_entry = kzalloc(sizeof(*new_entry), GFP_KERNEL);
-
-                        new_entry->key = tcp_key64;
-                        new_entry->ecn_bytes_per_ack = 0;
-                        new_entry->total_bytes_per_ack = 0;
-                        spin_lock_init(&new_entry->lock);
-
-                        rcv_data_hashtbl_insert(tcp_key64, new_entry);
-                        printk(KERN_INFO "rcv_data_hashtbl new entry inserted. %d --> %d\n", srcport, dstport);
-                        
-                    }
-
-                    //correct window scaling factor parser, see RFC 1323
-                    /* see also http://www.networksorcery.com/enp/protocol/tcp/option003.htm */
-                    tcp_key64 = get_tcp_key64(srcip, dstip, srcport, dstport);
-                    rcu_read_lock();
-                    ack_entry2 = rcv_ack_hashtbl_lookup(tcp_key64);
-                    rcu_read_unlock();
-                    if (!ack_entry2) {
-                        ack_entry2 = kzalloc(sizeof(*ack_entry2), GFP_KERNEL);
-                        ack_entry2->key = tcp_key64;
-                        rcv_ack_hashtbl_insert(tcp_key64, ack_entry2);
-                    }
-                    ack_entry2->snd_wscale = ovs_tcp_parse_options(skb);
-                    /*printk("incoming SYN, window scaling factor is %u, src %u-->dest %u, MSS is %u\n",
-                        ack_entry2->snd_wscale, ntohs(tcp->source), ntohs(tcp->dest), MSS);
-                    */
-                }
-                /*TODO: we may also need to consider RST */
-                if (unlikely(tcp->fin)) {
-                    struct rcv_data * new_entry = NULL;
-                    //pay attention to the parameter order
-                    tcp_key64 = get_tcp_key64(srcip, dstip, srcport, dstport);
-
-                    rcu_read_lock();
-                    new_entry = rcv_data_hashtbl_lookup(tcp_key64);
-                    rcu_read_unlock();
-                    if (likely(new_entry)) {
-                        rcv_data_hashtbl_delete(new_entry);
-                        printk(KERN_INFO "rcv_data_hashtbl new entry deleted. %d --> %d\n",
-                                srcport, dstport);
-                        
-                    }
-
-                    /*else {
-                        printk(KERN_INFO "rcv_data_hashtbl try to delete but entry not found.
-                            %d --> %d\n", srcport, dstport);
-                    }*/
-                }
-            }//incoming to the host traffic
-        }//is TCP packet
-    }//is IP packet
-    /*********************************************************************************/
-    /* Look up flow. */
-    flow = ovs_flow_tbl_lookup_stats(&dp->table, key, skb_get_hash(skb),
-                     &n_mask_hit);
-    if (unlikely(!flow)) {
-        struct dp_upcall_info upcall;
-        int error;
-
-        memset(&upcall, 0, sizeof(upcall));
-        upcall.cmd = OVS_PACKET_CMD_MISS;
-        upcall.portid = ovs_vport_find_upcall_portid(p, skb);
-        upcall.mru = OVS_CB(skb)->mru;
-        error = ovs_dp_upcall(dp, skb, key, &upcall, 0);
-        if (unlikely(error))
-            kfree_skb(skb);
-        else
-            consume_skb(skb);
-        stats_counter = &stats->n_missed;
-        goto out;
+            }
+        }
     }
-    /**********************************keqiang's logic********************************/
-    /*keqiang's logic, update rcv_data and rcv_ack table entries,
-    this piece of logic is better to implement after upcall -
-    SYN never carry data, so we won't update any bytes
-    TODO: it is better to disable OVS's TCP flag matching feature
-    */
-    if (ntohs(skb->protocol) == ETH_P_IP) { //this is an IP packet
-        nh = ip_hdr(skb);
-        if (nh->protocol == IPPROTO_TCP) { //this is an TCP packet
-            u32 srcip;
-            u32 dstip;
-            u16 srcport;
-            u16 dstport;
-            u64 tcp_key64;
 
-            tcp = tcp_hdr(skb);
 
-            srcip = ntohl(nh->saddr);
-            dstip = ntohl(nh->daddr);
-            srcport = ntohs(tcp->source);
-            dstport = ntohs(tcp->dest);
-            if (likely(!(tcp->syn || tcp->fin))) {//do not process SYN, SYN/ACK and FIN here
-                //process outgoing traffic
-                if (ovs_packet_to_net(skb)) {
-                    int tcp_data_len;
-                    u32 end_seq;
-                    struct rcv_ack * the_entry = NULL;
+    //If not set to NULL, kenel panic could happen.
+    nh = NULL;
+    tcp = NULL;
 
-                    //first task, update "snd_nxt" in "rcv_ack"
-                    tcp_data_len = ntohs(nh->tot_len) - (nh->ihl << 2) - (tcp->doff << 2);
-                    end_seq = ntohl(tcp->seq) + tcp_data_len;
+////////////
 
-                    tcp_key64 = get_tcp_key64(dstip, srcip, dstport, srcport);
 
-                    rcu_read_lock();
-                    the_entry = rcv_ack_hashtbl_lookup(tcp_key64);
-                    if (likely(the_entry)) {
-                        spin_lock(&the_entry->lock);
-                        if (tcp_data_len > 0 &&
-                                after(end_seq, the_entry->snd_nxt)) {
-                            the_entry->snd_nxt = end_seq;
-                            /*printk(KERN_INFO "tcp_data_len:%d, snd_nxt updated: %u (%d --> %d)\n",
-                                tcp_data_len, end_seq, srcport, dstport);
-                            */
+	/* Look up flow. */
+	flow = ovs_flow_tbl_lookup_stats(&dp->table, key, skb_get_hash(skb),
+					 &n_mask_hit);
+	if (unlikely(!flow)) {
+		struct dp_upcall_info upcall;
+		int error;
 
-                        }
-                        spin_unlock(&the_entry->lock);
-                    }
-                    rcu_read_unlock();
-		}//finish process outgoing traffic
-		else {// processing incoming (to the end host) skbs
-		    int tcp_data_len;
-                    struct rcv_data * the_entry = NULL;
+		memset(&upcall, 0, sizeof(upcall));
+		upcall.cmd = OVS_PACKET_CMD_MISS;
+		upcall.portid = ovs_vport_find_upcall_portid(p, skb);
+		upcall.mru = OVS_CB(skb)->mru;
+		error = ovs_dp_upcall(dp, skb, key, &upcall, 0);
+		if (unlikely(error))
+			kfree_skb(skb);
+		else
+			consume_skb(skb);
+		stats_counter = &stats->n_missed;
+		goto out;
+	}
 
-                    //first task, update "*_bytes_per_ack" in "rcv_data"
-                    tcp_data_len = ntohs(nh->tot_len) - (nh->ihl << 2) - (tcp->doff << 2);
-                    tcp_key64 = get_tcp_key64(srcip, dstip, srcport, dstport);
+	ovs_flow_stats_update(flow, key->tp.flags, skb);
+	sf_acts = rcu_dereference(flow->sf_acts);
+	ovs_execute_actions(dp, skb, sf_acts, key);
 
-                    //test purpose
-                    /*
-                    if (tcp_data_len > 0)
-                                            printk("this skb length is: %u\n", tcp_data_len);
-                    */
-                    if (tcp_data_len > 0) {
-                        rcu_read_lock();
-                        the_entry = rcv_data_hashtbl_lookup(tcp_key64);
-                        if (likely(the_entry)) {
-                            spin_lock(&the_entry->lock);
-                            the_entry->total_bytes_per_ack += tcp_data_len;
-                            if ( (nh->tos & OVS_ECN_MASK) == OVS_ECN_MASK)
-                                the_entry->ecn_bytes_per_ack += tcp_data_len;
-                            spin_unlock(&the_entry->lock);
-                        }
-                        rcu_read_unlock();
-                    }
-
-		    if (tcp->ack) {	
-			struct rcv_ack * ack_entry = NULL;
-			u32 acked = 0;
-			rcu_read_lock();
-                        ack_entry = rcv_ack_hashtbl_lookup(tcp_key64);
-			if (likely(ack_entry)) {
-                            spin_lock(&ack_entry->lock);
-			    if (before(ntohl(tcp->ack_seq), ack_entry->snd_una))
-                                    printk("STALE ACKS FOUND!!!!!!!!!!!!!!!!!!!!\n");
-			    acked = ntohl(tcp->ack_seq) - ack_entry->snd_una;
-			    ack_entry->snd_una = ntohl(tcp->ack_seq);
-			    /*theory behind: When a TCP sender receives 3 duplicate acknowledgements
-                            * for the same piece of data (i.e. 4 ACKs for the same segment,
-                            * which is not the most recently sent piece of data), then most likely,
-                            * packet was lost in the netowrk. DUP-ACK is faster than RTO*/
-                            if (acked == 0 && before(ack_entry->snd_una, ack_entry->snd_nxt) && (tcp_data_len == 0)
-                                        && ack_entry->prior_real_rcv_wnd == ntohs(tcp->window))
-                                    ack_entry->dupack_cnt ++;
-                            ack_entry->prior_real_rcv_wnd = ntohs(tcp->window);
-			    //do congestion control logic
-			    if (new_qlen < TIMELY_Qlow) {
-			    	ovs_tcp_reno_cong_avoid(ack_entry, acked);
-			    }
-			    else if (new_qlen > TIMELY_Qhigh) {
-				unsigned long reduced_win;
-				reduced_win = ((unsigned long)ack_entry->rwnd*(1024U-TIMELY_BETA) + (unsigned long)ack_entry->rwnd*TIMELY_BETA*TIMELY_Qhigh/new_qlen) >> 10U;
-				ack_entry->rwnd = max(RWND_MIN, (unsigned int)reduced_win);	
-			    }
-			    else if (normalized_gradient <= 0) {
-				ovs_tcp_reno_cong_avoid(ack_entry, acked);
-			    }
-			    else {
-				unsigned long reduced_win;
-				reduced_win = ((unsigned long)ack_entry->rwnd*(1024U*1024U-TIMELY_BETA*normalized_gradient)) >> 20U;
-				ack_entry->rwnd = max(RWND_MIN, (unsigned int)reduced_win);
-			    }
-			    printk(KERN_INFO "current RWND is:%u.\n", ack_entry->rwnd);
-			    if ( (ntohs(tcp->window) << ack_entry->snd_wscale) > ack_entry->rwnd) {
-                                    //modify receiver window at the receivers ovs
-                                    u16 enforce_win = ack_entry->rwnd >> ack_entry->snd_wscale;
-                                    tcp->window = htons(enforce_win);
-                            }
-			    spin_unlock(&ack_entry->lock);
-			}//finish likely(ack_entry)
-			rcu_read_unlock();
-		  }// finish if (tcp->ack)
-		}//finish processing incoming (to the end host) skbs
-	    } //finish do not process SYN, SYN/ACK and FIN here
-        }//tcp
-    }//ip 
-    /***********************************************************************************************************************/
-    ovs_flow_stats_update(flow, key->tp.flags, skb);
-    sf_acts = rcu_dereference(flow->sf_acts);
-    /***********************************************************************************************************************/
-    ovs_execute_actions(dp, skb, sf_acts, key);
-
-    stats_counter = &stats->n_hit;
+	stats_counter = &stats->n_hit;
 
 out:
-    /* Update datapath statistics. */
-    u64_stats_update_begin(&stats->syncp);
-    (*stats_counter)++;
-    stats->n_mask_hit += n_mask_hit;
-    u64_stats_update_end(&stats->syncp);
+	/* Update datapath statistics. */
+	u64_stats_update_begin(&stats->syncp);
+	(*stats_counter)++;
+	stats->n_mask_hit += n_mask_hit;
+	u64_stats_update_end(&stats->syncp);
 }
-
-
-
-
 
 int ovs_dp_upcall(struct datapath *dp, struct sk_buff *skb,
 		  const struct sw_flow_key *key,
@@ -1726,7 +1074,7 @@ static int queue_userspace_packet(struct datapath *dp, struct sk_buff *skb,
 
 	/* Complete checksum if needed */
 	if (skb->ip_summed == CHECKSUM_PARTIAL &&
-	     (err = skb_csum_hwoffload_help(skb, 0)))
+	    (err = skb_csum_hwoffload_help(skb, 0)))
 		goto out;
 
 	/* Older versions of OVS user space enforce alignment of the last
@@ -1835,7 +1183,6 @@ static int ovs_packet_cmd_execute(struct sk_buff *skb, struct genl_info *info)
 	struct sw_flow *flow;
 	struct sw_flow_actions *sf_acts;
 	struct datapath *dp;
-	struct ethhdr *eth;
 	struct vport *input_vport;
 	u16 mru = 0;
 	int len;
@@ -1855,18 +1202,6 @@ static int ovs_packet_cmd_execute(struct sk_buff *skb, struct genl_info *info)
 	skb_reserve(packet, NET_IP_ALIGN);
 
 	nla_memcpy(__skb_put(packet, len), a[OVS_PACKET_ATTR_PACKET], len);
-
-	skb_reset_mac_header(packet);
-	eth = eth_hdr(packet);
-
-	/* Normally, setting the skb 'protocol' field would be handled by a
-	 * call to eth_type_trans(), but it assumes there's a sending
-	 * device, which we may not have.
-	 */
-	if (eth_proto_is_802_3(eth->h_proto))
-		packet->protocol = eth->h_proto;
-	else
-		packet->protocol = htons(ETH_P_802_2);
 
 	/* Set packet's mru */
 	if (a[OVS_PACKET_ATTR_MRU]) {
@@ -1946,8 +1281,7 @@ static struct genl_ops dp_packet_genl_ops[] = {
 	}
 };
 
-static struct genl_family dp_packet_genl_family = {
-	.id = GENL_ID_GENERATE,
+static struct genl_family dp_packet_genl_family __ro_after_init = {
 	.hdrsize = sizeof(struct ovs_header),
 	.name = OVS_PACKET_FAMILY,
 	.version = OVS_PACKET_VERSION,
@@ -1956,6 +1290,7 @@ static struct genl_family dp_packet_genl_family = {
 	.parallel_ops = true,
 	.ops = dp_packet_genl_ops,
 	.n_ops = ARRAY_SIZE(dp_packet_genl_ops),
+	.module = THIS_MODULE,
 };
 
 static void get_dp_stats(const struct datapath *dp, struct ovs_dp_stats *stats,
@@ -2203,7 +1538,6 @@ static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
 	struct sw_flow_mask mask;
 	struct sk_buff *reply;
 	struct datapath *dp;
-	struct sw_flow_key key;
 	struct sw_flow_actions *acts;
 	struct sw_flow_match match;
 	u32 ufid_flags = ovs_nla_get_ufid_flags(a[OVS_FLOW_ATTR_UFID_FLAGS]);
@@ -2231,26 +1565,23 @@ static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
 	}
 
 	/* Extract key. */
-	ovs_match_init(&match, &key, false, &mask);
+	ovs_match_init(&match, &new_flow->key, false, &mask);
 	error = ovs_nla_get_match(net, &match, a[OVS_FLOW_ATTR_KEY],
 				  a[OVS_FLOW_ATTR_MASK], log);
 	if (error)
 		goto err_kfree_flow;
 
-	ovs_flow_mask_key(&new_flow->key, &key, true, &mask);
-
 	/* Extract flow identifier. */
 	error = ovs_nla_get_identifier(&new_flow->id, a[OVS_FLOW_ATTR_UFID],
-				       &key, log);
+				       &new_flow->key, log);
 	if (error)
 		goto err_kfree_flow;
 
-    /* From new datapath --> */
-    /* unmasked key is needed to match when ufid is not used. */
-    if (ovs_identifier_is_key(&new_flow->id))
-        match.key = new_flow->id.unmasked_key;
-    ovs_flow_mask_key(&new_flow->key, &new_flow->key, true, &mask);
-    /* <-- From new datapath */
+	/* unmasked key is needed to match when ufid is not used. */
+	if (ovs_identifier_is_key(&new_flow->id))
+		match.key = new_flow->id.unmasked_key;
+
+	ovs_flow_mask_key(&new_flow->key, &new_flow->key, true, &mask);
 
 	/* Validate actions. */
 	error = ovs_nla_copy_actions(net, a[OVS_FLOW_ATTR_ACTIONS],
@@ -2278,7 +1609,7 @@ static int ovs_flow_cmd_new(struct sk_buff *skb, struct genl_info *info)
 	if (ovs_identifier_is_ufid(&new_flow->id))
 		flow = ovs_flow_tbl_lookup_ufid(&dp->table, &new_flow->id);
 	if (!flow)
-		flow = ovs_flow_tbl_lookup(&dp->table, &key);
+		flow = ovs_flow_tbl_lookup(&dp->table, &new_flow->key);
 	if (likely(!flow)) {
 		rcu_assign_pointer(new_flow->sf_acts, acts);
 
@@ -2397,38 +1728,42 @@ static struct sw_flow_actions *get_flow_actions(struct net *net,
  * to mask.
  * */
 static int ovs_nla_init_match_and_action(struct net *net,
-                     struct sw_flow_match *match,
-                     struct sw_flow_key *key,
-                     struct nlattr **a,
-                     struct sw_flow_actions **acts,
-                     bool log)
+					 struct sw_flow_match *match,
+					 struct sw_flow_key *key,
+					 struct nlattr **a,
+					 struct sw_flow_actions **acts,
+					 bool log)
 {
-    struct sw_flow_mask mask;
-    int error = 0;
-    if (a[OVS_FLOW_ATTR_KEY]) {
-        ovs_match_init(match, key, true, &mask);
-        error = ovs_nla_get_match(net, match, a[OVS_FLOW_ATTR_KEY],
-                      a[OVS_FLOW_ATTR_MASK], log);
-        if (error)
-            goto error;
-    }
-    if (a[OVS_FLOW_ATTR_ACTIONS]) {
-        if (!a[OVS_FLOW_ATTR_KEY]) {
-            OVS_NLERR(log,
-                  "Flow key attribute not present in set flow.");
-            return -EINVAL;
-        }
-        *acts = get_flow_actions(net, a[OVS_FLOW_ATTR_ACTIONS], key,
-                     &mask, log);
-        if (IS_ERR(*acts)) {
-            error = PTR_ERR(*acts);
-            goto error;
-        }
-    }
-    /* On success, error is 0. */
+	struct sw_flow_mask mask;
+	int error = 0;
+
+	if (a[OVS_FLOW_ATTR_KEY]) {
+		ovs_match_init(match, key, true, &mask);
+		error = ovs_nla_get_match(net, match, a[OVS_FLOW_ATTR_KEY],
+					  a[OVS_FLOW_ATTR_MASK], log);
+		if (error)
+			goto error;
+	}
+
+	if (a[OVS_FLOW_ATTR_ACTIONS]) {
+		if (!a[OVS_FLOW_ATTR_KEY]) {
+			OVS_NLERR(log,
+				  "Flow key attribute not present in set flow.");
+			return -EINVAL;
+		}
+
+		*acts = get_flow_actions(net, a[OVS_FLOW_ATTR_ACTIONS], key,
+					 &mask, log);
+		if (IS_ERR(*acts)) {
+			error = PTR_ERR(*acts);
+			goto error;
+		}
+	}
+
+	/* On success, error is 0. */
 error:
-    match->mask = NULL;
-    return error;
+	match->mask = NULL;
+	return error;
 }
 
 static int ovs_flow_cmd_set(struct sk_buff *skb, struct genl_info *info)
@@ -2438,7 +1773,6 @@ static int ovs_flow_cmd_set(struct sk_buff *skb, struct genl_info *info)
 	struct ovs_header *ovs_header = info->userhdr;
 	struct sw_flow_key key;
 	struct sw_flow *flow;
-	struct sw_flow_mask mask;
 	struct sk_buff *reply = NULL;
 	struct datapath *dp;
 	struct sw_flow_actions *old_acts = NULL, *acts = NULL;
@@ -2450,34 +1784,18 @@ static int ovs_flow_cmd_set(struct sk_buff *skb, struct genl_info *info)
 	bool ufid_present;
 
 	ufid_present = ovs_nla_get_ufid(&sfid, a[OVS_FLOW_ATTR_UFID], log);
-	if (a[OVS_FLOW_ATTR_KEY]) {
-		ovs_match_init(&match, &key, true, &mask);
-		error = ovs_nla_get_match(net, &match, a[OVS_FLOW_ATTR_KEY],
-					  a[OVS_FLOW_ATTR_MASK], log);
-	} else if (!ufid_present) {
+	if (!a[OVS_FLOW_ATTR_KEY] && !ufid_present) {
 		OVS_NLERR(log,
 			  "Flow set message rejected, Key attribute missing.");
-		error = -EINVAL;
+		return -EINVAL;
 	}
+
+	error = ovs_nla_init_match_and_action(net, &match, &key, a,
+					      &acts, log);
 	if (error)
 		goto error;
 
-	/* Validate actions. */
-	if (a[OVS_FLOW_ATTR_ACTIONS]) {
-		if (!a[OVS_FLOW_ATTR_KEY]) {
-			OVS_NLERR(log,
-				  "Flow key attribute not present in set flow.");
-			error = -EINVAL;
-			goto error;
-		}
-
-		acts = get_flow_actions(net, a[OVS_FLOW_ATTR_ACTIONS], &key,
-					&mask, log);
-		if (IS_ERR(acts)) {
-			error = PTR_ERR(acts);
-			goto error;
-		}
-
+	if (acts) {
 		/* Can allocate before locking if have acts. */
 		reply = ovs_flow_cmd_alloc_info(acts, &sfid, info, false,
 						ufid_flags);
@@ -2766,8 +2084,7 @@ static struct genl_ops dp_flow_genl_ops[] = {
 	},
 };
 
-static struct genl_family dp_flow_genl_family = {
-	.id = GENL_ID_GENERATE,
+static struct genl_family dp_flow_genl_family __ro_after_init = {
 	.hdrsize = sizeof(struct ovs_header),
 	.name = OVS_FLOW_FAMILY,
 	.version = OVS_FLOW_VERSION,
@@ -2778,7 +2095,7 @@ static struct genl_family dp_flow_genl_family = {
 	.n_ops = ARRAY_SIZE(dp_flow_genl_ops),
 	.mcgrps = &ovs_dp_flow_multicast_group,
 	.n_mcgrps = 1,
-    .module = THIS_MODULE,
+	.module = THIS_MODULE,
 };
 
 static size_t ovs_dp_cmd_msg_size(void)
@@ -3152,8 +2469,7 @@ static struct genl_ops dp_datapath_genl_ops[] = {
 	},
 };
 
-static struct genl_family dp_datapath_genl_family = {
-	.id = GENL_ID_GENERATE,
+static struct genl_family dp_datapath_genl_family __ro_after_init = {
 	.hdrsize = sizeof(struct ovs_header),
 	.name = OVS_DATAPATH_FAMILY,
 	.version = OVS_DATAPATH_VERSION,
@@ -3164,7 +2480,7 @@ static struct genl_family dp_datapath_genl_family = {
 	.n_ops = ARRAY_SIZE(dp_datapath_genl_ops),
 	.mcgrps = &ovs_dp_datapath_multicast_group,
 	.n_mcgrps = 1,
-    .module = THIS_MODULE,
+	.module = THIS_MODULE,
 };
 
 /* Called with ovs_mutex or RCU read lock. */
@@ -3575,8 +2891,7 @@ static struct genl_ops dp_vport_genl_ops[] = {
 	},
 };
 
-struct genl_family dp_vport_genl_family = {
-	.id = GENL_ID_GENERATE,
+struct genl_family dp_vport_genl_family __ro_after_init = {
 	.hdrsize = sizeof(struct ovs_header),
 	.name = OVS_VPORT_FAMILY,
 	.version = OVS_VPORT_VERSION,
@@ -3587,7 +2902,7 @@ struct genl_family dp_vport_genl_family = {
 	.n_ops = ARRAY_SIZE(dp_vport_genl_ops),
 	.mcgrps = &ovs_dp_vport_multicast_group,
 	.n_mcgrps = 1,
-    .module = THIS_MODULE,
+	.module = THIS_MODULE,
 };
 
 static struct genl_family *dp_genl_families[] = {
@@ -3631,8 +2946,8 @@ static int __net_init ovs_init_net(struct net *net)
 	INIT_LIST_HEAD(&ovs_net->dps);
 	INIT_WORK(&ovs_net->dp_notify_work, ovs_dp_notify_wq);
 	ovs_ct_init(net);
-    ovs_netns_frags_init(net);
-    ovs_netns_frags6_init(net);
+	ovs_netns_frags_init(net);
+	ovs_netns_frags6_init(net);
 	return 0;
 }
 
@@ -3668,8 +2983,8 @@ static void __net_exit ovs_exit_net(struct net *dnet)
 	struct net *net;
 	LIST_HEAD(head);
 
-    ovs_netns_frags6_exit(dnet);
-    ovs_netns_frags_exit(dnet);
+	ovs_netns_frags6_exit(dnet);
+	ovs_netns_frags_exit(dnet);
 	ovs_ct_exit(dnet);
 	ovs_lock();
 	list_for_each_entry_safe(dp, dp_next, &ovs_net->dps, list_node)
@@ -3700,86 +3015,85 @@ static struct pernet_operations ovs_net_ops = {
 
 static int __init dp_init(void)
 {
-    int err;
+	int err;
 
-    BUILD_BUG_ON(sizeof(struct ovs_skb_cb) > FIELD_SIZEOF(struct sk_buff, cb));
+	BUILD_BUG_ON(sizeof(struct ovs_skb_cb) > FIELD_SIZEOF(struct sk_buff, cb));
 
-    pr_info("Open vSwitch switching datapath %s\n", VERSION);
+	pr_info("Open vSwitch switching datapath %s\n", VERSION);
 
-    err = action_fifos_init();
-    if (err)
-        goto error;
+	__hashtable_test();
 
-    err = ovs_internal_dev_rtnl_link_register();
-    if (err)
-        goto error_action_fifos_exit;
+	err = action_fifos_init();
+	if (err)
+		goto error;
 
-    err = ovs_flow_init();
-    if (err)
-        goto error_unreg_rtnl_link;
+	err = ovs_internal_dev_rtnl_link_register();
+	if (err)
+		goto error_action_fifos_exit;
 
-    err = ovs_vport_init();
-    if (err)
-        goto error_flow_exit;
+	err = ovs_flow_init();
+	if (err)
+		goto error_unreg_rtnl_link;
 
-    err = register_pernet_device(&ovs_net_ops);
-    if (err)
-        goto error_vport_exit;
+	err = ovs_vport_init();
+	if (err)
+		goto error_flow_exit;
 
-    err = compat_init();
-    if (err)
-        goto error_netns_exit;
+	err = register_pernet_device(&ovs_net_ops);
+	if (err)
+		goto error_vport_exit;
 
-    err = register_netdevice_notifier(&ovs_dp_device_notifier);
-    if (err)
-        goto error_compat_exit;
+	err = compat_init();
+	if (err)
+		goto error_netns_exit;
 
-    err = ovs_netdev_init();
-    if (err)
-        goto error_unreg_notifier;
+	err = register_netdevice_notifier(&ovs_dp_device_notifier);
+	if (err)
+		goto error_compat_exit;
 
-    err = dp_register_genl();
-    if (err < 0)
-        goto error_unreg_netdev;
+	err = ovs_netdev_init();
+	if (err)
+		goto error_unreg_notifier;
 
-    return 0;
+	err = dp_register_genl();
+	if (err < 0)
+		goto error_unreg_netdev;
+
+	return 0;
 
 error_unreg_netdev:
-    ovs_netdev_exit();
+	ovs_netdev_exit();
 error_unreg_notifier:
-    unregister_netdevice_notifier(&ovs_dp_device_notifier);
+	unregister_netdevice_notifier(&ovs_dp_device_notifier);
 error_compat_exit:
-    compat_exit();
+	compat_exit();
 error_netns_exit:
-    unregister_pernet_device(&ovs_net_ops);
+	unregister_pernet_device(&ovs_net_ops);
 error_vport_exit:
-    ovs_vport_exit();
+	ovs_vport_exit();
 error_flow_exit:
-    ovs_flow_exit();
+	ovs_flow_exit();
 error_unreg_rtnl_link:
-    ovs_internal_dev_rtnl_link_unregister();
+	ovs_internal_dev_rtnl_link_unregister();
 error_action_fifos_exit:
-    action_fifos_exit();
+	action_fifos_exit();
 error:
-    return err;
+	return err;
 }
 
 static void dp_cleanup(void)
 {
+    __hashtbl_exit();
 	dp_unregister_genl(ARRAY_SIZE(dp_genl_families));
 	ovs_netdev_exit();
 	unregister_netdevice_notifier(&ovs_dp_device_notifier);
+	compat_exit();
 	unregister_pernet_device(&ovs_net_ops);
 	rcu_barrier();
 	ovs_vport_exit();
 	ovs_flow_exit();
 	ovs_internal_dev_rtnl_link_unregister();
 	action_fifos_exit();
-	compat_exit();
-	/**************************************keqiang's logic*******************************************/
-	//keqiang's logic
-    __hashtbl_exit();
-	/************************************************************************************************/
 }
 
 module_init(dp_init);
