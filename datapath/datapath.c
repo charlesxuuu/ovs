@@ -812,6 +812,7 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
 //////virtopia//////
     struct iphdr *nh = NULL;
     struct tcphdr *tcp = NULL;
+
     if (ntohs(skb->protocol) == ETH_P_IP) { //this is an IP packet
         printk(KERN_INFO "skb->protocol == ETH_P_IP ok");
         nh = ip_hdr(skb);  // in <linux/ip.h> 
@@ -844,19 +845,20 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
 
                     u64 sender_key; 
                     u64 receiver_key;
-                    u32 *token = NULL;
+                    u32 token;
 
                     sender_key = mopt.mptcp_sender_key;
                     receiver_key = mopt.mptcp_receiver_key;
                     token = mopt.mptcp_rem_token;
 
                     printk(KERN_INFO "[MPTCP SYN] %d --> %d\n, sender_key is %llu, receiver_key is %llu, token is %u", 
-                        srcport, dstport, sender_key, receiver_key, *token);
+                        srcport, dstport, sender_key, receiver_key, token);
                 }
 
 
                 if (unlikely(tcp->ack)) {
-                    u32 *token;                    
+                    u32 token;
+                    token = 0;                    
                     printk(KERN_INFO "ack");
                     struct mptcp_options_received mopt;
                     printk(KERN_INFO "ack: struct mptcp_options_received mopt;");
@@ -864,11 +866,10 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
                     printk(KERN_INFO "ack: mptcp_init_mp_opt(&mopt);");
                     tcp_parse_mptcp_options(skb, &mopt);
                     printk(KERN_INFO "ack: tcp_parse_mptcp_options(skb, &mopt);");
-                    u64 receiver_key;
-                    mptcp_key_sha1(mopt.mptcp_receiver_key, token, NULL);
+                    mptcp_key_sha1(mopt.mptcp_receiver_key, &token, NULL);
                     printk(KERN_INFO "ack: tcp_parse_mptcp_options(skb, &mopt);");
                     printk(KERN_INFO "[MPTCP ACK] %d --> %d\n, receiver_key is %llu, calculated token is %u", 
-                        srcport, dstport, mopt.mptcp_receiver_key, *token);
+                        srcport, dstport, mopt.mptcp_receiver_key, token);
                 }
             }
         }
