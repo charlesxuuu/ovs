@@ -46,14 +46,4 @@
 
 /* test function for virtopia */
 
-void virtopia_test(void)
-{
-	printk("virtopia_test");
-} 
-
-/* test extern function for virtopia */
-
-void virtopia_extern_test(void)
-{
-	printk("virtopia_extern_test");
-} 
+void virtopia_test(void);

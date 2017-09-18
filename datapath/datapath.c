@@ -61,7 +61,10 @@
 #include "vport-internal_dev.h"
 #include "vport-netdev.h"
 
+
 //////virtopia//////
+#include "virtopia.h"
+
 #include <linux/hashtable.h>
 #include <linux/cryptohash.h>
 #include <net/mptcp.h> // must be MPTCP Linux kernel 
@@ -794,11 +797,10 @@ static u8 ovs_tcp_parse_options(const struct sk_buff *skb) {
 
 
 
-
 /* Must be called with rcu_read_lock. */
 void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
 {
-	printk(KERN_INFO "in proc packet");
+	//printk(KERN_INFO "in proc packet");
 	const struct vport *p = OVS_CB(skb)->input_vport;
 	struct datapath *dp = p->dp;
 	struct sw_flow *flow;
@@ -810,15 +812,21 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
 	stats = this_cpu_ptr(dp->stats_percpu);
 
 //////virtopia//////
+    //test virtopia.h and virtopia.c
+    //extern void virtopia_extern_test(void);
+    //virtopia_test();
+    //virtopia_extern_test();
+
+
     struct iphdr *nh = NULL;
     struct tcphdr *tcp = NULL;
 
     if (ntohs(skb->protocol) == ETH_P_IP) { //this is an IP packet
-        printk(KERN_INFO "skb->protocol == ETH_P_IP ok");
+        //printk(KERN_INFO "skb->protocol == ETH_P_IP ok");
         nh = ip_hdr(skb);  // in <linux/ip.h> 
-        printk(KERN_INFO "nh->protocol: %u IPPROTO_TCP: %u", nh->protocol, IPPROTO_TCP);
+        //printk(KERN_INFO "nh->protocol: %u IPPROTO_TCP: %u", nh->protocol, IPPROTO_TCP);
         if (nh->protocol == IPPROTO_TCP) { //this is an TCP packet
-            printk(KERN_INFO "nh->protocol == IPPROTO_TCP ok");
+            //printk(KERN_INFO "nh->protocol == IPPROTO_TCP ok");
             u32 srcip;
             u32 dstip;
             u16 srcport;
@@ -835,11 +843,11 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
 
             if (ovs_packet_to_net(skb)) {
                 if (unlikely(tcp->syn)) {
-                    printk(KERN_INFO "syn");
+                    //printk(KERN_INFO "syn");
                     struct mptcp_options_received mopt;
-                    printk(KERN_INFO "syn: struct mptcp_options_received mopt;");
+                    //printk(KERN_INFO "syn: struct mptcp_options_received mopt;");
                     mptcp_init_mp_opt(&mopt);
-                    printk(KERN_INFO "syn: mptcp_init_mp_opt(&mopt);");
+                    //printk(KERN_INFO "syn: mptcp_init_mp_opt(&mopt);");
                     tcp_parse_mptcp_options(skb, &mopt);
                     printk(KERN_INFO "syn: tcp_parse_mptcp_options(skb, &mopt);");
 
@@ -859,15 +867,16 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
                 if (unlikely(tcp->ack)) {
                     u32 token;
                     token = 0;                    
-                    printk(KERN_INFO "ack");
+                    //printk(KERN_INFO "ack");
                     struct mptcp_options_received mopt;
-                    printk(KERN_INFO "ack: struct mptcp_options_received mopt;");
+                    //printk(KERN_INFO "ack: struct mptcp_options_received mopt;");
                     mptcp_init_mp_opt(&mopt);
-                    printk(KERN_INFO "ack: mptcp_init_mp_opt(&mopt);");
+                    //printk(KERN_INFO "ack: mptcp_init_mp_opt(&mopt);");
                     tcp_parse_mptcp_options(skb, &mopt);
                     printk(KERN_INFO "ack: tcp_parse_mptcp_options(skb, &mopt);");
                     mptcp_key_sha1(mopt.mptcp_receiver_key, &token, NULL);
-                    printk(KERN_INFO "ack: tcp_parse_mptcp_options(skb, &mopt);");
+                    printk(KERN_INFO "mptcp_key_sha1(mopt.mptcp_receiver_key, &token, NULL);");
+
                     printk(KERN_INFO "[MPTCP ACK] %d --> %d\n, receiver_key is %llu, calculated token is %u", 
                         srcport, dstport, mopt.mptcp_receiver_key, token);
                 }
