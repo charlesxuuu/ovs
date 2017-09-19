@@ -65,459 +65,6 @@
 //////virtopia//////
 #include "virtopia.h"
 
-#include <linux/hashtable.h>
-#include <linux/cryptohash.h>
-#include <net/mptcp.h> // must be MPTCP Linux kernel 
-#include <net/tcp.h>  //must be MPTCP Linux kernel
-
-
-extern void tcp_parse_mptcp_options(const struct sk_buff *skb,
-                 struct mptcp_options_received *mopt);
-extern void mptcp_key_sha1(u64 key, u32 *token, u64 *idsn);
-
-
-//hashtable lock
-static DEFINE_SPINLOCK(datalock);
-static DEFINE_SPINLOCK(acklock);
-static DEFINE_SPINLOCK(tokenlock);
-
-/*TODO for production code, use resizable hashtable
-A technique related to IBM, https://lwn.net/Articles/612021/
-*/
-//hashtable
-#define TBL_SIZE 15U
-static DEFINE_HASHTABLE(rcv_data_hashtbl, TBL_SIZE);
-static DEFINE_HASHTABLE(rcv_ack_hashtbl, TBL_SIZE);
-static DEFINE_HASHTABLE(token_key_hashtbl, TBL_SIZE);
-
-#define BRIDGE_NAME "ovsbr*"
-
-struct rcv_data {
-    u64 key; //key of a flow, {LOW16(srcip), LOW16(dstip), tcpsrc, tcpdst}
-    u32 ecn_bytes_per_ack; //32 bit should be sufficient
-    u32 total_bytes_per_ack; //32 bit should be sufficient
-    spinlock_t lock; //lock for read/write, write/write conflicts
-    struct hlist_node hash;
-    struct rcu_head rcu;
-};
-
-struct rcv_ack {
-    u64 key;
-    u32 rwnd;
-    u32 rwnd_ssthresh;
-    u32 rwnd_clamp;
-    u32 alpha;
-    u32 snd_una;
-    u32 snd_nxt;
-    u32 next_seq;
-    u8 snd_wscale;
-    u32 snd_rwnd_cnt;
-    u16 prior_real_rcv_wnd;
-    u32 dupack_cnt;
-    bool loss_detected_this_win;
-    bool reduced_this_win;
-    u32 ecn_bytes;
-    u32 total_bytes;
-    spinlock_t lock;
-    struct hlist_node hash;
-    struct rcu_head rcu;
-
-    u64 receiver_key;
-    u32 remote_token; 
-    u64 peer_subflow_key;
-
-};
-
-struct token_key {
-    u32 token; //this is the actual key in token_key_hashtb;
-    u64 tcp_key64;    // master sk tcp_key64 calculated by get_tcp_key64(4 tuple)
-    u32 srcip; // master sk srcip
-    u32 dstip; // master sk dstip
-    u16 srcport; // master sk srcport
-    u16 dstport; // master sk dstprot
-    spinlock_t lock;
-    struct hlist_node hash;
-    struct rcu_head rcu;
-};
-
-/*rcv_data_hashtbl functions*/
-
-static u16 ovs_hash_min(u64 key, int size) {
-    u16 low16;
-    u32 low32;
-
-    low16 = key & ((1UL << 16) - 1);
-    low32 = key & ((1UL << 32) - 1);
-
-    low32 = low32 >> 16;
-    return (low16 + low32) % (1 << size);
-}
-
-//insert a new entry
-static void rcv_data_hashtbl_insert(u64 key, struct rcv_data *value)
-{
-    u32 bucket_hash;
-    bucket_hash = ovs_hash_min(key, HASH_BITS(rcv_data_hashtbl)); //hash_min is the same as hash_long if key is 64bit
-    //lock the table
-    spin_lock(&datalock);
-    hlist_add_head_rcu(&value->hash, &rcv_data_hashtbl[bucket_hash]);
-    spin_unlock(&datalock);
-}
-
-static void free_rcv_data_rcu(struct rcu_head *rp)
-{
-    struct rcv_data * tofree = container_of(rp, struct rcv_data, rcu);
-    kfree(tofree);
-}
-
-static void rcv_data_hashtbl_delete(struct rcv_data *value)
-{
-    //lock the table
-    spin_lock(&datalock);
-    hlist_del_init_rcu(&value->hash);
-    spin_unlock(&datalock);
-    call_rcu(&value->rcu, free_rcv_data_rcu);
-}
-
-//caller must use "rcu_read_lock()" to guard it
-static struct rcv_data * rcv_data_hashtbl_lookup(u64 key)
-{
-    int j = 0;
-    struct rcv_data * v_iter = NULL;
-
-
-    j = ovs_hash_min(key, HASH_BITS(rcv_data_hashtbl));
-    hlist_for_each_entry_rcu(v_iter, &rcv_data_hashtbl[j], hash)
-    if (v_iter->key == key) /* iterm found*/
-        return v_iter;
-    return NULL; /*return NULL if can not find it */
-}
-
-//delete all entries in the hashtable
-static void rcv_data_hashtbl_destroy(void)
-{
-    struct rcv_data * v_iter;
-    struct hlist_node * tmp;
-    int j = 0;
-
-    rcu_barrier(); //wait until all rcu_call are finished
-
-    spin_lock(&datalock); //no new insertion or deletion !
-    hash_for_each_safe(rcv_data_hashtbl, j, tmp, v_iter, hash) {
-        hash_del(&v_iter->hash);
-        kfree(v_iter);
-        pr_info("delete one entry from rcv_data_hashtbl table\n");
-    }
-    spin_unlock(&datalock);
-}
-
-/*functions for rcv_ack_hashtbl*/
-//insert a new entru
-static void rcv_ack_hashtbl_insert(u64 key, struct rcv_ack *value)
-{
-    u32 bucket_hash;
-    bucket_hash = ovs_hash_min(key, HASH_BITS(rcv_ack_hashtbl)); //hash_min is the same as hash_long if key is 64bit
-    //lock the table
-    spin_lock(&acklock);
-    hlist_add_head_rcu(&value->hash, &rcv_ack_hashtbl[bucket_hash]);
-    spin_unlock(&acklock);
-}
-
-static void free_rcv_ack_rcu(struct rcu_head *rp)
-{
-    struct rcv_ack * tofree = container_of(rp, struct rcv_ack, rcu);
-    kfree(tofree);
-}
-
-static void rcv_ack_hashtbl_delete(struct rcv_ack *value)
-{
-    //lock the table
-    spin_lock(&acklock);
-    hlist_del_init_rcu(&value->hash);
-    spin_unlock(&acklock);
-    call_rcu(&value->rcu, free_rcv_ack_rcu);
-}
-
-//caller must use "rcu_read_lock()" to guard it
-static struct rcv_ack * rcv_ack_hashtbl_lookup(u64 key)
-{
-    int j = 0;
-    struct rcv_ack * v_iter = NULL;
-
-
-    j = ovs_hash_min(key, HASH_BITS(rcv_ack_hashtbl));
-    hlist_for_each_entry_rcu(v_iter, &rcv_ack_hashtbl[j], hash)
-    if (v_iter->key == key) /* iterm found*/
-        return v_iter;
-    return NULL; /*return NULL if can not find it */
-}
-
-//delete all entries in the hashtable
-static void rcv_ack_hashtbl_destroy(void)
-{
-    struct rcv_ack * v_iter;
-    struct hlist_node * tmp;
-    int j = 0;
-
-    rcu_barrier(); //wait until all rcu_call are finished
-
-    spin_lock(&acklock); //no new insertion or deletion !
-    hash_for_each_safe(rcv_ack_hashtbl, j, tmp, v_iter, hash) {
-        hash_del(&v_iter->hash);
-        kfree(v_iter);
-        pr_info("delete one entry from rcv_ack_hashtbl table\n");
-    }
-    spin_unlock(&acklock);
-}
-
-
-
-/*functions for rcv_ack_hashtbl*/
-//insert a new entry
-static void token_key_hashtbl_insert(u32 token, struct token_key *value)
-{
-    u32 bucket_hash;
-    bucket_hash = ovs_hash_min((u64)token, HASH_BITS(token_key_hashtbl)); //hash_min is the same as hash_long if key is 64bit
-    //lock the table
-    spin_lock(&tokenlock);
-    hlist_add_head_rcu(&value->hash, &token_key_hashtbl[bucket_hash]);
-    spin_unlock(&tokenlock);
-}
-
-static void free_token_key_rcu(struct rcu_head *rp)
-{
-    struct token_key * tofree = container_of(rp, struct token_key, rcu);
-    kfree(tofree);
-}
-
-static void token_key_hashtbl_delete(struct token_key *value)
-{
-    //lock the table
-    spin_lock(&tokenlock);
-    hlist_del_init_rcu(&value->hash);
-    spin_unlock(&tokenlock);
-    call_rcu(&value->rcu, free_token_key_rcu);
-}
-
-//caller must use "rcu_read_lock()" to guard it
-static struct token_key * token_key_hashtbl_lookup(u32 token)
-{
-    int j = 0;
-    struct token_key * v_iter = NULL;
-
-
-    j = ovs_hash_min((u64)token, HASH_BITS(token_key_hashtbl));
-    hlist_for_each_entry_rcu(v_iter, &token_key_hashtbl[j], hash)
-    if (v_iter->token == token) /* iterm found*/
-        return v_iter;
-    return NULL; /*return NULL if can not find it */
-}
-
-//delete all entries in the hashtable
-static void token_key_hashtbl_destroy(void)
-{
-    struct token_key * v_iter;
-    struct hlist_node * tmp;
-    int j = 0;
-
-    rcu_barrier(); //wait until all rcu_call are finished
-
-    spin_lock(&tokenlock); //no new insertion or deletion !
-    hash_for_each_safe(token_key_hashtbl, j, tmp, v_iter, hash) {
-        hash_del(&v_iter->hash);
-        kfree(v_iter);
-        pr_info("delete one entry from token_key_hashtbl table\n");
-    }
-    spin_unlock(&tokenlock);
-}
-
-
-//clear the 3 hash tables we added, used in module exit function
-static void __hashtbl_exit(void) {
-    rcv_data_hashtbl_destroy();
-    rcv_ack_hashtbl_destroy();
-    token_key_hashtbl_destroy();
-}
-
-
-
-//rcv_data, rcv_ack, token_key hash table tests*/
-static void __hashtable_test(void) {
-    u64 i;
-    u64 j;
-    struct timeval tstart;
-    struct timeval tend;
-
-    printk(KERN_INFO "start hashtbl tests.\n");
-
-    /*rcv_data_hashtbl performance*/
-    do_gettimeofday(&tstart);
-    for (i = 0; i < (1 << TBL_SIZE); i ++) {
-        struct rcv_data * value = NULL;
-        value = kzalloc(sizeof(*value), GFP_KERNEL);
-        value->key = i;
-        rcv_data_hashtbl_insert(i, value);
-    }
-
-    do_gettimeofday(&tend);
-    printk("rcv_data_hashtbl insert time taken: %ld microseconds\n", 1000000 * (tend.tv_sec - tstart.tv_sec) +
-           (tend.tv_usec - tstart.tv_usec) );
-
-
-    do_gettimeofday(&tstart);
-    for (i = 0; i < (1 << TBL_SIZE); i ++) {
-        for (j = 0; j < (1 << TBL_SIZE); j ++) {
-            struct rcv_data * value = NULL;
-            rcu_read_lock();
-            value = rcv_data_hashtbl_lookup(j);
-            rcu_read_unlock();
-        }
-    }
-    do_gettimeofday(&tend);
-    printk("rcv_data_hashtbl lookup time taken: %ld microseconds\n", 1000000 * (tend.tv_sec - tstart.tv_sec) +
-           (tend.tv_usec - tstart.tv_usec) );
-
-
-    for (i = 0; i < (1 << TBL_SIZE); i ++) {
-        struct rcv_data * value = NULL;
-        rcu_read_lock();
-        value = rcv_data_hashtbl_lookup(i);
-        if (value)
-            ;
-        //printk("lookup okay, value->key:%lu\n", value->key);
-        else
-            printk("rcv_data_hashtbl lookup bad!\n");
-        rcu_read_unlock();
-    }
-
-
-    do_gettimeofday(&tstart);
-    for (i = 0; i < (1 << TBL_SIZE); i ++) {
-        struct rcv_data * value = NULL;
-        rcu_read_lock();
-        value = rcv_data_hashtbl_lookup(i);
-        rcu_read_unlock();
-        rcv_data_hashtbl_delete(value);
-    }
-    do_gettimeofday(&tend);
-    printk("rcv_data_hashtbl deletion time taken: %ld microseconds\n", 1000000 * (tend.tv_sec - tstart.tv_sec) +
-           (tend.tv_usec - tstart.tv_usec) );
-
-
-
-    /*rcv_ack_hashtbl performance*/
-    do_gettimeofday(&tstart);
-    for (i = 0; i < (1 << TBL_SIZE); i ++) {
-        struct rcv_ack * value = NULL;
-        value = kzalloc(sizeof(*value), GFP_KERNEL);
-        value->key = i;
-        rcv_ack_hashtbl_insert(i, value);
-    }
-
-    do_gettimeofday(&tend);
-    printk("rcv_ack_hashtbl insert time taken: %ld microseconds\n", 1000000 * (tend.tv_sec - tstart.tv_sec) +
-           (tend.tv_usec - tstart.tv_usec) );
-
-    //Lookup performance
-    do_gettimeofday(&tstart);
-    for (i = 0; i < (1 << TBL_SIZE); i ++) {
-        for (j = 0; j < (1 << TBL_SIZE); j ++) {
-            struct rcv_ack * value = NULL;
-            rcu_read_lock();
-            value = rcv_ack_hashtbl_lookup(j);
-            rcu_read_unlock();
-        }
-    }
-    do_gettimeofday(&tend);
-    printk("rcv_ack_hashtbl lookup time taken: %ld microseconds\n", 1000000 * (tend.tv_sec - tstart.tv_sec) +
-           (tend.tv_usec - tstart.tv_usec) );
-
-    //correctness check of lookup
-    for (i = 0; i < (1 << TBL_SIZE); i ++) {
-        struct rcv_ack * value = NULL;
-        rcu_read_lock();
-        value = rcv_ack_hashtbl_lookup(i);
-        if (value)
-            ;
-        //printk("lookup okay, value->key:%lu\n", value->key);
-        else
-            printk("rcv_ack_hashtbl lookup bad!\n");
-        rcu_read_unlock();
-    }
-
-    //delete performacne
-    do_gettimeofday(&tstart);
-    for (i = 0; i < (1 << TBL_SIZE); i ++) {
-        struct rcv_ack * value = NULL;
-        rcu_read_lock();
-        value = rcv_ack_hashtbl_lookup(i);
-        rcu_read_unlock();
-        rcv_ack_hashtbl_delete(value);
-    }
-    do_gettimeofday(&tend);
-    printk("rcv_ack_hashtbl deletion time taken: %ld microseconds\n", 1000000 * (tend.tv_sec - tstart.tv_sec) +
-           (tend.tv_usec - tstart.tv_usec) );
-
-
-    
-    /*token_key_hashtbl performance*/
-    do_gettimeofday(&tstart);
-    for (i = 0; i < (1 << TBL_SIZE); i ++) {
-        struct token_key * value = NULL;
-        value = kzalloc(sizeof(*value), GFP_KERNEL);
-        value->token = i;
-        token_key_hashtbl_insert(i, value);
-    }
-
-    do_gettimeofday(&tend);
-    printk("token_key_hashtbl insert time taken: %ld microseconds\n", 1000000 * (tend.tv_sec - tstart.tv_sec) +
-           (tend.tv_usec - tstart.tv_usec) );
-
-    //Lookup performance
-    do_gettimeofday(&tstart);
-    for (i = 0; i < (1 << TBL_SIZE); i ++) {
-        for (j = 0; j < (1 << TBL_SIZE); j ++) {
-            struct token_key * value = NULL;
-            rcu_read_lock();
-            value = token_key_hashtbl_lookup(j);
-            rcu_read_unlock();
-        }
-    }
-    do_gettimeofday(&tend);
-    printk("token_key_hashtbl lookup time taken: %ld microseconds\n", 1000000 * (tend.tv_sec - tstart.tv_sec) +
-           (tend.tv_usec - tstart.tv_usec) );
-
-    //correctness check of lookup
-    for (i = 0; i < (1 << TBL_SIZE); i ++) {
-        struct token_key * value = NULL;
-        rcu_read_lock();
-        value = token_key_hashtbl_lookup(i);
-        if (value)
-            ;
-        //printk("lookup okay, value->key:%lu\n", value->key);
-        else
-            printk("token_key_hashtbl lookup bad!\n");
-        rcu_read_unlock();
-    }
-
-    //delete performacne
-    do_gettimeofday(&tstart);
-    for (i = 0; i < (1 << TBL_SIZE); i ++) {
-        struct token_key * value = NULL;
-        rcu_read_lock();
-        value = token_key_hashtbl_lookup(i);
-        rcu_read_unlock();
-        token_key_hashtbl_delete(value);
-    }
-    do_gettimeofday(&tend);
-    printk("token_key_hashtbl deletion time taken: %ld microseconds\n", 1000000 * (tend.tv_sec - tstart.tv_sec) +
-           (tend.tv_usec - tstart.tv_usec) );
-
-
-
-    printk(KERN_INFO "end hashtbl tests.\n");
-}
-
 
 unsigned int ovs_net_id __read_mostly;
 
@@ -714,89 +261,6 @@ void ovs_dp_detach_port(struct vport *p)
 }
 
 
-
-/*help function get a u64 key for a TCP flow */
-static u64 get_tcp_key64(u32 ip1, u32 ip2, u16 tp1, u16 tp2) {
-    u64 key = 0;
-    u64 part1, part2, part3, part4;
-
-    part1 = ip1 & ((1 << 16) - 1); // get the lower 16 bits of u32
-    part1 = part1 << 48; //the highest 16 bits of the result
-
-    part2 = ip2 & ((1 << 16) - 1);
-    part2 = part2 << 32;
-
-    part3 = tp1 << 16;
-
-    part4 = tp2;
-
-    key = part1 + part2 + part3 + part4;
-    return key;
-
-}
-
-/*helper function, determine the direction of the traffic (packet), i.e., go to the net or come to the host?*/
-static bool ovs_packet_to_net(struct sk_buff *skb) {
-    if (strncmp(skb->dev->name, BRIDGE_NAME, 5) == 0 )
-        return 1;
-    else
-        return 0;
-}
-
-
-/*extract window scaling factor, Normally only called on SYN and SYNACK packets.
-see http://packetlife.net/blog/2010/aug/4/tcp-windows-and-window-scaling/
-TODO: we do not consider the case that one side uses scaling while the other does
-not support it (in this case, both should not use scaling factor).
-This should be handled in production code
-*/
-
-static u8 ovs_tcp_parse_options(const struct sk_buff *skb) {
-    u8 snd_wscale = 0;
-
-    const unsigned char *ptr;
-    const struct tcphdr *th = tcp_hdr(skb);
-    int length = (th->doff * 4) - sizeof(struct tcphdr);
-
-    ptr = (const unsigned char *)(th + 1);
-
-    while (length > 0) {
-        int opcode = *ptr++;
-        int opsize;
-        switch (opcode) {
-        case TCPOPT_EOL:
-            return 0;
-        case TCPOPT_NOP:        /* Ref: RFC 793 section 3.1 */
-            length--;
-            continue;
-        default:
-            opsize = *ptr++;
-            if (opsize < 2) /* "silly options" */
-                return 0;
-            if (opsize > length)
-                return 0; /* don't parse partial options */
-            switch (opcode) {
-            case TCPOPT_WINDOW:
-                if (opsize == TCPOLEN_WINDOW && th->syn) {
-                    snd_wscale = *(__u8 *)ptr;
-                    if (snd_wscale > 14) {
-                        printk("Illegal window scaling: %u\n", snd_wscale);
-                        snd_wscale = 14;
-                    }
-                }
-                break;
-            default:
-                break;
-            }
-            ptr += opsize - 2;
-            length -= opsize;
-        }
-    }
-    return snd_wscale;
-}
-
-
-
 /* Must be called with rcu_read_lock. */
 void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
 {
@@ -811,78 +275,108 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
 
 	stats = this_cpu_ptr(dp->stats_percpu);
 
-//////virtopia//////
+    //////virtopia//////
+    
+    /*
     //test virtopia.h and virtopia.c
-    //extern void virtopia_extern_test(void);
-    //virtopia_test();
-    //virtopia_extern_test();
-
+    extern void virtopia_extern_test(void);
+    virtopia_test();
+    virtopia_extern_test();
+    */
 
     struct iphdr *nh = NULL;
     struct tcphdr *tcp = NULL;
 
-    if (ntohs(skb->protocol) == ETH_P_IP) { //this is an IP packet
-        //printk(KERN_INFO "skb->protocol == ETH_P_IP ok");
-        nh = ip_hdr(skb);  // in <linux/ip.h> 
-        //printk(KERN_INFO "nh->protocol: %u IPPROTO_TCP: %u", nh->protocol, IPPROTO_TCP);
-        if (nh->protocol == IPPROTO_TCP) { //this is an TCP packet
-            //printk(KERN_INFO "nh->protocol == IPPROTO_TCP ok");
+
+    if (ntohs(skb->protocol) == ETH_P_IP) { // IP apcket
+        nh = ip_hdr(skb);
+        if (nh->protocol == IPPROTO_TCP) { // TCP packet
+            tcp = tcp_hdr(skb);
             u32 srcip;
             u32 dstip;
             u16 srcport;
             u16 dstport;
-            u64 tcp_key64;
-
-            tcp = tcp_hdr(skb);
-
             srcip = ntohl(nh->saddr);
             dstip = ntohl(nh->daddr);
             srcport = ntohs(tcp->source);
             dstport = ntohs(tcp->dest);
-	        printk(KERN_INFO "sip %u dip %u spt %u dpt %u", srcip, dstip, srcport, dstport);
 
             if (ovs_packet_to_net(skb)) {
                 if (unlikely(tcp->syn)) {
-                    //printk(KERN_INFO "syn");
-                    struct mptcp_options_received mopt;
-                    //printk(KERN_INFO "syn: struct mptcp_options_received mopt;");
-                    mptcp_init_mp_opt(&mopt);
-                    //printk(KERN_INFO "syn: mptcp_init_mp_opt(&mopt);");
-                    tcp_parse_mptcp_options(skb, &mopt);
-                    printk(KERN_INFO "syn: tcp_parse_mptcp_options(skb, &mopt);");
-
-                    u64 sender_key; 
-                    u64 receiver_key;
-                    u32 token;
-
-                    sender_key = mopt.mptcp_sender_key;
-                    receiver_key = mopt.mptcp_receiver_key;
-                    token = mopt.mptcp_rem_token;
-
-                    printk(KERN_INFO "[MPTCP SYN] %d --> %d\n, sender_key is %llu, receiver_key is %llu, token is %u", 
-                        srcport, dstport, sender_key, receiver_key, token);
+                    virtopia_proc_syn(skb, nh, tcp);
                 }
-
-
                 if (unlikely(tcp->ack)) {
-                    u32 token;
-                    token = 0;                    
-                    //printk(KERN_INFO "ack");
-                    struct mptcp_options_received mopt;
-                    //printk(KERN_INFO "ack: struct mptcp_options_received mopt;");
-                    mptcp_init_mp_opt(&mopt);
-                    //printk(KERN_INFO "ack: mptcp_init_mp_opt(&mopt);");
-                    tcp_parse_mptcp_options(skb, &mopt);
-                    printk(KERN_INFO "ack: tcp_parse_mptcp_options(skb, &mopt);");
-                    mptcp_key_sha1(mopt.mptcp_receiver_key, &token, NULL);
-                    printk(KERN_INFO "mptcp_key_sha1(mopt.mptcp_receiver_key, &token, NULL);");
-
-                    printk(KERN_INFO "[MPTCP ACK] %d --> %d\n, receiver_key is %llu, calculated token is %u", 
-                        srcport, dstport, mopt.mptcp_receiver_key, token);
+                    virtopia_proc_ack(skb, nh, tcp);
+                }
+                if (unlikely(tcp->fin)) {
+                    virtopia_proc_fin(skb, nh, tcp);
                 }
             }
         }
     }
+
+    // if (ntohs(skb->protocol) == ETH_P_IP) { //this is an IP packet
+    //     //printk(KERN_INFO "skb->protocol == ETH_P_IP ok");
+    //     nh = ip_hdr(skb);  // in <linux/ip.h> 
+    //     //printk(KERN_INFO "nh->protocol: %u IPPROTO_TCP: %u", nh->protocol, IPPROTO_TCP);
+    //     if (nh->protocol == IPPROTO_TCP) { //this is an TCP packet
+    //         //printk(KERN_INFO "nh->protocol == IPPROTO_TCP ok");
+    //         u32 srcip;
+    //         u32 dstip;
+    //         u16 srcport;
+    //         u16 dstport;
+    //         u64 tcp_key64;
+
+    //         tcp = tcp_hdr(skb);
+
+    //         srcip = ntohl(nh->saddr);
+    //         dstip = ntohl(nh->daddr);
+    //         srcport = ntohs(tcp->source);
+    //         dstport = ntohs(tcp->dest);
+	   //      //printk(KERN_INFO "sip %u dip %u spt %u dpt %u", srcip, dstip, srcport, dstport);
+
+    //         if (ovs_packet_to_net(skb)) {
+    //             if (unlikely(tcp->syn)) {
+    //                 //printk(KERN_INFO "syn");
+    //                 struct mptcp_options_received mopt;
+    //                 //printk(KERN_INFO "syn: struct mptcp_options_received mopt;");
+    //                 mptcp_init_mp_opt(&mopt);
+    //                 //printk(KERN_INFO "syn: mptcp_init_mp_opt(&mopt);");
+    //                 tcp_parse_mptcp_options(skb, &mopt);
+    //                 printk(KERN_INFO "syn: tcp_parse_mptcp_options(skb, &mopt);");
+
+    //                 u64 sender_key; 
+    //                 u64 receiver_key;
+    //                 u32 token;
+
+    //                 sender_key = mopt.mptcp_sender_key;
+    //                 receiver_key = mopt.mptcp_receiver_key;
+    //                 token = mopt.mptcp_rem_token;
+
+    //                 printk(KERN_INFO "[MPTCP SYN] %d --> %d, sender_key is %llu, receiver_key is %llu, token is %u", 
+    //                     srcport, dstport, sender_key, receiver_key, token);
+    //             }
+
+
+    //             if (unlikely(tcp->ack)) {
+    //                 u32 token;
+    //                 token = 0;                    
+    //                 //printk(KERN_INFO "ack");
+    //                 struct mptcp_options_received mopt;
+    //                 //printk(KERN_INFO "ack: struct mptcp_options_received mopt;");
+    //                 mptcp_init_mp_opt(&mopt);
+    //                 //printk(KERN_INFO "ack: mptcp_init_mp_opt(&mopt);");
+    //                 tcp_parse_mptcp_options(skb, &mopt);
+    //                 printk(KERN_INFO "ack: tcp_parse_mptcp_options(skb, &mopt);");
+    //                 mptcp_key_sha1(mopt.mptcp_receiver_key, &token, NULL);
+    //                 printk(KERN_INFO "mptcp_key_sha1(mopt.mptcp_receiver_key, &token, NULL);");
+
+    //                 printk(KERN_INFO "[MPTCP ACK] %d --> %d, receiver_key is %llu, calculated token is %u", 
+    //                     srcport, dstport, mopt.mptcp_receiver_key, token);
+    //             }
+    //         }
+    //     }
+    // }
 
 
     //If not set to NULL, kenel panic could happen.
