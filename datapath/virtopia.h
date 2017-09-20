@@ -89,7 +89,7 @@ struct rcv_ack {
 
 struct token_key {
     u32 token; //this is the actual key in token_key_hashtb;
-    u64 tcp_key64;    // master sk tcp_key64 calculated by get_tcp_key64(4 tuple)
+    u64 key;    // master sk tcp_key64 calculated by get_tcp_key64(4 tuple)
     u32 srcip; // master sk srcip
     u32 dstip; // master sk dstip
     u16 srcport; // master sk srcport
@@ -573,6 +573,6 @@ static u8 ovs_tcp_parse_options(const struct sk_buff *skb) {
 void virtopia_proc_syn(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
 
 
-void virtopia_proc_ack(struct sk_buff *skb);
+void virtopia_proc_init_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
 
 void virtopia_proc_fin(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);

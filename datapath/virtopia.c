@@ -143,23 +143,25 @@ void virtopia_proc_syn(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp
         existing_token_key = token_key_hashtbl_lookup(token);
         rcu_read_unlock();
 
-        if(existing_token_key != NULL) {
+        if(existing_token_key) {
             struct rcv_ack *master_subflow_ack_entry = NULL;
-            master_subflow_ack_entry = rcv_ack_hashtbl_lookup(existing_token_key->tcp_key64);
+            master_subflow_ack_entry = rcv_ack_hashtbl_lookup(existing_token_key->key);
             //mutual key association
-            if (master_subflow_ack_entry != NULL) {
+            if (master_subflow_ack_entry) {
                 master_subflow_ack_entry->peer_subflow_key = tcp_key64;
                 new_entry->peer_subflow_key = master_subflow_ack_entry->key;
             }
             master_subflow_ack_entry = NULL;
         }
+
+        existing_token_key = NULL;
     }
 
     new_entry = NULL;
 }
 
 
-void virtopia_proc_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp) {
+void virtopia_proc_init_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp) {
 	u32 srcip;
     u32 dstip;
     u16 srcport;
@@ -171,47 +173,58 @@ void virtopia_proc_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp
     srcport = ntohs(tcp->source);
     dstport = ntohs(tcp->dest);
 
-
+    u64 sender_key; 
+    u64 receiver_key;
 	u32 calc_token;
-    calc_token = 0;
+
+
     struct mptcp_options_received mopt;
     mptcp_init_mp_opt(&mopt);
     tcp_parse_mptcp_options(skb, &mopt);
-    mptcp_key_sha1(mopt.mptcp_receiver_key, &calc_token, NULL);
+
+    sender_key = mopt.mptcp_sender_key;
+    receiver_key = mopt.mptcp_receiver_key;
+    calc_token = 0;
+    
+
+    if (sender_key != 0 && receiver_key != 0) {//this is an init ack
+        mptcp_key_sha1(receiver_key, &calc_token, NULL);
+
+        #ifdef IPERF_DEBUG
+        if (dstport == 5001) {
+        	printk(KERN_INFO "[MPTCP ACK] receiver_key is %llu, calculated token is %u", 
+        		mopt.mptcp_receiver_key, calc_token);
+        }
+        #endif
+
+        struct rcv_ack *cur_entry = NULL;
+        tcp_key64 = get_tcp_key64(dstip, srcip, dstport, srcport);
+        rcu_read_lock();
+        cur_entry = rcv_ack_hashtbl_lookup(tcp_key64);
+        rcu_read_unlock();
+
+        if (cur_entry) {
+            cur_entry->remote_token = calc_token;
+        }
+        cur_entry = NULL;
 
 
-    #ifdef IPERF_DEBUG
-    if (dstport == 5001) {
-    	printk(KERN_INFO "[MPTCP ACK] receiver_key is %llu, calculated token is %u", 
-    		mopt.mptcp_receiver_key, calc_token);
+    	struct token_key *new_token_key = NULL;
+        rcu_read_lock();
+        new_token_key = token_key_hashtbl_lookup(calc_token);
+        rcu_read_unlock();
+        if (unlikely(!new_token_key)) {
+            new_token_key = kzalloc(sizeof(*new_token_key), GFP_KERNEL);
+            new_token_key->token = calc_token;
+            new_token_key->key = tcp_key64;
+            new_token_key->srcip = srcip;
+            new_token_key->dstip = dstip;
+            new_token_key->srcport = srcport;
+            new_token_key->dstport = dstport;
+            token_key_hashtbl_insert(calc_token, new_token_key);
+        }
+        new_token_key = NULL;
     }
-    #endif
-
-	struct rcv_ack *cur_entry = NULL;
-    tcp_key64 = get_tcp_key64(dstip, srcip, dstport, srcport);
-    rcu_read_lock();
-    cur_entry = rcv_ack_hashtbl_lookup(tcp_key64);
-    rcu_read_unlock();
-
-	cur_entry->remote_token = calc_token;
-	cur_entry = NULL;
-
-
-	struct token_key *new_token_key = NULL;
-    rcu_read_lock();
-    new_token_key = token_key_hashtbl_lookup(calc_token);
-    rcu_read_unlock();
-    if (likely(!new_token_key)) {
-        new_token_key = kzalloc(sizeof(*new_token_key), GFP_KERNEL);
-        new_token_key->token = calc_token;
-        new_token_key->tcp_key64 = get_tcp_key64(dstip, srcip, dstport, srcport);
-        new_token_key->srcip = srcip;
-        new_token_key->dstip = dstip;
-        new_token_key->srcport = srcport;
-        new_token_key->dstport = dstport;
-        rcv_ack_hashtbl_insert(calc_token, new_token_key);
-    }
-    new_token_key = NULL;
 }
 
 

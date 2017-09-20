@@ -302,11 +302,11 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
             dstport = ntohs(tcp->dest);
 
             if (ovs_packet_to_net(skb)) {
-                if (unlikely(tcp->syn)) {
+                if (unlikely(tcp->syn && !tcp->ack)) {
                     virtopia_proc_syn(skb, nh, tcp);
                 }
                 if (unlikely(tcp->ack)) {
-                    virtopia_proc_ack(skb, nh, tcp);
+                    virtopia_proc_init_ack(skb, nh, tcp);
                 }
                 if (unlikely(tcp->fin)) {
                     virtopia_proc_fin(skb, nh, tcp);
