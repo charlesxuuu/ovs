@@ -49,7 +49,7 @@ static DEFINE_HASHTABLE(rcv_data_hashtbl, TBL_SIZE);
 static DEFINE_HASHTABLE(rcv_ack_hashtbl, TBL_SIZE);
 static DEFINE_HASHTABLE(token_key_hashtbl, TBL_SIZE);
 
-#define BRIDGE_NAME "ovsbr*"
+#define VIF_NAME "tap*"
 
 struct rcv_data {
     u64 key; //key of a flow, {LOW16(srcip), LOW16(dstip), tcpsrc, tcpdst}
@@ -508,8 +508,8 @@ static u64 get_tcp_key64(u32 ip1, u32 ip2, u16 tp1, u16 tp2) {
 }
 
 /*helper function, determine the direction of the traffic (packet), i.e., go to the net or come to the host?*/
-static bool ovs_packet_to_net(struct sk_buff *skb) {
-    if (strncmp(skb->dev->name, BRIDGE_NAME, 5) == 0 )
+static bool ovs_vm_packet(struct sk_buff *skb) {
+    if (strncmp(skb->dev->name, VIF_NAME, 3) == 0 )
         return 1;
     else
         return 0;
@@ -572,7 +572,10 @@ static u8 ovs_tcp_parse_options(const struct sk_buff *skb) {
 
 void virtopia_proc_syn(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
 
+void virtopia_proc_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
 
-void virtopia_proc_init_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
+void virtopia_proc_data(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
+
+void virtopia_proc_data_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
 
 void virtopia_proc_fin(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);

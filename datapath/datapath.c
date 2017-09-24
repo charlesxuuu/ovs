@@ -273,6 +273,19 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
 	u64 *stats_counter;
 	u32 n_mask_hit;
 
+	if (p != NULL)	{
+		if (p->dev != NULL) {
+			printk(KERN_INFO "vport name (p->dev->name) is %s", p->dev->name);
+			if(p->dev->qdisc != NULL) {
+				//printk(KERN_INFO "has qdisc!");
+				if (strncmp(p->dev->name, VIF_NAME, 3) == 0) {
+						printk(KERN_INFO "p->dev->qdisc->q.qlen is %u", p->dev->qdisc->q.qlen);
+				}
+			}
+		}
+	}
+
+
 	stats = this_cpu_ptr(dp->stats_percpu);
 
     //////virtopia//////
@@ -284,9 +297,10 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
     virtopia_extern_test();
     */
 
-    struct iphdr *nh = NULL;
-    struct tcphdr *tcp = NULL;
-
+    struct iphdr *nh; 
+    struct tcphdr *tcp; 
+    nh = NULL;
+    tcp = NULL;
 
     if (ntohs(skb->protocol) == ETH_P_IP) { // IP apcket
         nh = ip_hdr(skb);
@@ -301,15 +315,21 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
             srcport = ntohs(tcp->source);
             dstport = ntohs(tcp->dest);
 
-            if (ovs_packet_to_net(skb)) {
+            if (ovs_vm_packet(skb)) {
                 if (unlikely(tcp->syn && !tcp->ack)) {
                     virtopia_proc_syn(skb, nh, tcp);
                 }
-                if (unlikely(tcp->ack)) {
-                    virtopia_proc_init_ack(skb, nh, tcp);
-                }
+
                 if (unlikely(tcp->fin)) {
                     virtopia_proc_fin(skb, nh, tcp);
+                }
+
+                if (likely(tcp->ack)) {
+                    virtopia_proc_ack(skb, nh, tcp);
+                }
+
+                if (likely(!(tcp->syn || tcp->ack))) {
+                	//virtopia_proc_data(skb, nh, tcp);
                 }
             }
         }
