@@ -77,7 +77,7 @@ void virtopia_init_rcv_ack(struct rcv_ack *new_entry, struct tcphdr *tcp)
  * Process SYN packet
  * TCP_SYN / MPTCP_SYN_INI / MPTCP_SYN_JOIN
  */
-void virtopia_proc_syn(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp) 
+void virtopia_out_syn(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp) 
 {
 	//TCP_SYN or MPTCP_SYN
     u32 srcip;
@@ -168,7 +168,7 @@ void virtopia_proc_syn(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp
 }
 
 
-void virtopia_proc_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp) 
+void virtopia_out_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp) 
 {
 	u32 srcip;
     u32 dstip;
@@ -255,18 +255,19 @@ void virtopia_proc_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp
         cur_entry = rcv_ack_hashtbl_lookup(tcp_key64);
         rcu_read_unlock();
 
+        if (likely(cur_entry)) {
+            struct rcv_ack *master_subflow_ack_entry;
+            master_subflow_ack_entry = NULL;
+            rcu_read_lock();
+            master_subflow_ack_entry = rcv_ack_hashtbl_lookup(cur_entry->peer_subflow_key);
+            rcu_read_unlock();
 
-        struct rcv_ack *master_subflow_ack_entry;
-        master_subflow_ack_entry = NULL;
-        rcu_read_lock();
-        master_subflow_ack_entry = rcv_ack_hashtbl_lookup(cur_entry->peer_subflow_key);
-        rcu_read_unlock();
+            if (master_subflow_ack_entry) {
+                master_subflow_ack_entry->peer_subflow_key = tcp_key64;
+            }
 
-        if (master_subflow_ack_entry) {
-            master_subflow_ack_entry->peer_subflow_key = tcp_key64;
+            master_subflow_ack_entry = NULL;
         }
-
-        master_subflow_ack_entry = NULL;
         cur_entry = NULL;
 
     }
@@ -279,12 +280,12 @@ void virtopia_proc_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp
         }
         #endif
 
-        virtopia_proc_data_ack(skb, nh, tcp);
+        virtopia_out_data_ack(skb, nh, tcp);
     }
 
 }
 
-void virtopia_proc_data(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp) 
+void virtopia_out_data(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp) 
 {
     u32 srcip;
     u32 dstip;
@@ -304,7 +305,7 @@ void virtopia_proc_data(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tc
 
 
 
-void virtopia_proc_data_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp) 
+void virtopia_out_data_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp) 
 {
     // Do congestion control
 
@@ -346,7 +347,7 @@ void virtopia_proc_data_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr
         ack_entry->prior_real_rcv_wnd = ntohs(tcp->window);
 
         unsigned long reduced_win;
-        reduced_win = ((unsigned long)ack_entry->rwnd) >> 10U;
+        reduced_win = ((unsigned long)ack_entry->rwnd) >> 2U;
         ack_entry->rwnd = max(RWND_MIN, (unsigned int)reduced_win);
         printk(KERN_INFO "current RWND is:%u.\n", ack_entry->rwnd);
 
@@ -371,7 +372,7 @@ void virtopia_proc_data_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr
 }
 
 
-void virtopia_proc_fin(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp) {
+void virtopia_out_fin(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp) {
     u32 srcip;
     u32 dstip;
     u16 srcport;
@@ -401,6 +402,6 @@ void virtopia_proc_fin(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp
             		srcport, dstport);
 	}
 	#endif
-
     new_entry = NULL;
+    
 }

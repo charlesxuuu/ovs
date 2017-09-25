@@ -508,7 +508,7 @@ static u64 get_tcp_key64(u32 ip1, u32 ip2, u16 tp1, u16 tp2) {
 }
 
 /*helper function, determine the direction of the traffic (packet), i.e., go to the net or come to the host?*/
-static bool ovs_vm_packet(struct sk_buff *skb) {
+static bool ovs_out_packet(struct sk_buff *skb) {
     if (strncmp(skb->dev->name, VIF_NAME, 3) == 0 )
         return 1;
     else
@@ -570,12 +570,12 @@ static u8 ovs_tcp_parse_options(const struct sk_buff *skb) {
 
 
 
-void virtopia_proc_syn(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
+void virtopia_out_syn(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
 
-void virtopia_proc_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
+void virtopia_out_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
 
-void virtopia_proc_data(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
+void virtopia_out_data_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
 
-void virtopia_proc_data_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
+void virtopia_out_data(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
 
-void virtopia_proc_fin(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
+void virtopia_out_fin(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
