@@ -273,17 +273,20 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
 	u64 *stats_counter;
 	u32 n_mask_hit;
 
-	if (p != NULL)	{
-		if (p->dev != NULL) {
-			printk(KERN_INFO "vport name (p->dev->name) is %s", p->dev->name);
-			if(p->dev->qdisc != NULL) {
-				//printk(KERN_INFO "has qdisc!");
-				if (strncmp(p->dev->name, VIF_NAME, 3) == 0) {
-						printk(KERN_INFO "p->dev->qdisc->q.qlen is %u", p->dev->qdisc->q.qlen);
-				}
-			}
-		}
-	}
+	// if (p != NULL)	{
+	// 	if (p->dev != NULL) {
+	// 		//printk(KERN_INFO "vport name (p->dev->name) is %s", p->dev->name);
+	// 		if(p->dev->qdisc != NULL) {
+	// 			//printk(KERN_INFO "has qdisc!");
+	// 			if (strncmp(p->dev->name, VIF_NAME, 3) == 0) {
+	// 					printk(KERN_INFO "p->dev->qdisc->q.qlen is %u", p->dev->qdisc->q.qlen);
+	// 					//if (p->dev->ingress_queue->qdisc) {
+	// 					//	printk(KERN_INFO "p->dev->ingress_queue->qdisc.qlen is %u", p->dev->ingress_queue->qdisc->q.qlen);
+	// 					//}
+	// 			}
+	// 		}
+	// 	}
+	// }
 
 
 	stats = this_cpu_ptr(dp->stats_percpu);
@@ -327,77 +330,9 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
                 if (likely(tcp->ack)) {
                     virtopia_proc_ack(skb, nh, tcp);
                 }
-
-                if (likely(!(tcp->syn || tcp->ack))) {
-                	//virtopia_proc_data(skb, nh, tcp);
-                }
             }
         }
     }
-
-    // if (ntohs(skb->protocol) == ETH_P_IP) { //this is an IP packet
-    //     //printk(KERN_INFO "skb->protocol == ETH_P_IP ok");
-    //     nh = ip_hdr(skb);  // in <linux/ip.h> 
-    //     //printk(KERN_INFO "nh->protocol: %u IPPROTO_TCP: %u", nh->protocol, IPPROTO_TCP);
-    //     if (nh->protocol == IPPROTO_TCP) { //this is an TCP packet
-    //         //printk(KERN_INFO "nh->protocol == IPPROTO_TCP ok");
-    //         u32 srcip;
-    //         u32 dstip;
-    //         u16 srcport;
-    //         u16 dstport;
-    //         u64 tcp_key64;
-
-    //         tcp = tcp_hdr(skb);
-
-    //         srcip = ntohl(nh->saddr);
-    //         dstip = ntohl(nh->daddr);
-    //         srcport = ntohs(tcp->source);
-    //         dstport = ntohs(tcp->dest);
-	   //      //printk(KERN_INFO "sip %u dip %u spt %u dpt %u", srcip, dstip, srcport, dstport);
-
-    //         if (ovs_packet_to_net(skb)) {
-    //             if (unlikely(tcp->syn)) {
-    //                 //printk(KERN_INFO "syn");
-    //                 struct mptcp_options_received mopt;
-    //                 //printk(KERN_INFO "syn: struct mptcp_options_received mopt;");
-    //                 mptcp_init_mp_opt(&mopt);
-    //                 //printk(KERN_INFO "syn: mptcp_init_mp_opt(&mopt);");
-    //                 tcp_parse_mptcp_options(skb, &mopt);
-    //                 printk(KERN_INFO "syn: tcp_parse_mptcp_options(skb, &mopt);");
-
-    //                 u64 sender_key; 
-    //                 u64 receiver_key;
-    //                 u32 token;
-
-    //                 sender_key = mopt.mptcp_sender_key;
-    //                 receiver_key = mopt.mptcp_receiver_key;
-    //                 token = mopt.mptcp_rem_token;
-
-    //                 printk(KERN_INFO "[MPTCP SYN] %d --> %d, sender_key is %llu, receiver_key is %llu, token is %u", 
-    //                     srcport, dstport, sender_key, receiver_key, token);
-    //             }
-
-
-    //             if (unlikely(tcp->ack)) {
-    //                 u32 token;
-    //                 token = 0;                    
-    //                 //printk(KERN_INFO "ack");
-    //                 struct mptcp_options_received mopt;
-    //                 //printk(KERN_INFO "ack: struct mptcp_options_received mopt;");
-    //                 mptcp_init_mp_opt(&mopt);
-    //                 //printk(KERN_INFO "ack: mptcp_init_mp_opt(&mopt);");
-    //                 tcp_parse_mptcp_options(skb, &mopt);
-    //                 printk(KERN_INFO "ack: tcp_parse_mptcp_options(skb, &mopt);");
-    //                 mptcp_key_sha1(mopt.mptcp_receiver_key, &token, NULL);
-    //                 printk(KERN_INFO "mptcp_key_sha1(mopt.mptcp_receiver_key, &token, NULL);");
-
-    //                 printk(KERN_INFO "[MPTCP ACK] %d --> %d, receiver_key is %llu, calculated token is %u", 
-    //                     srcport, dstport, mopt.mptcp_receiver_key, token);
-    //             }
-    //         }
-    //     }
-    // }
-
 
     //If not set to NULL, kenel panic could happen.
     nh = NULL;

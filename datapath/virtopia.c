@@ -256,53 +256,33 @@ void virtopia_proc_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp
         rcu_read_unlock();
 
 
-        struct rcv_ack *master_subflow_ack_entry;
-        master_subflow_ack_entry = NULL;
-        rcu_read_lock();
-        master_subflow_ack_entry = rcv_ack_hashtbl_lookup(cur_entry->peer_subflow_key);
-        rcu_read_unlock();
+        if (cur_entry) {
+            struct rcv_ack *master_subflow_ack_entry;
+            master_subflow_ack_entry = NULL;
+            rcu_read_lock();
+            master_subflow_ack_entry = rcv_ack_hashtbl_lookup(cur_entry->peer_subflow_key);
+            rcu_read_unlock();
 
-        if (master_subflow_ack_entry) {
-            master_subflow_ack_entry->peer_subflow_key = tcp_key64;
+            if (master_subflow_ack_entry) {
+                master_subflow_ack_entry->peer_subflow_key = tcp_key64;
+            }
+            master_subflow_ack_entry = NULL;
         }
-
-        master_subflow_ack_entry = NULL;
         cur_entry = NULL;
-
     }
 
-    if (mopt.saw_mpc == 0 && mopt.is_mp_join == 0 && mopt.join_ack == 0) {
-        #ifdef IPERF_DEBUG
-        if (dstport == 5001) {
-            printk(KERN_INFO "[MPTCP ACK] srcport is %d, dstport is %d, saw_mpc is %d, is_mp_join is %d, join_ack is %d", 
-            srcport, dstport, mopt.saw_mpc, mopt.is_mp_join, mopt.join_ack);
-        }
-        #endif
+    // if (mopt.saw_mpc == 0 && mopt.is_mp_join == 0 && mopt.join_ack == 0) {
+    //     #ifdef IPERF_DEBUG
+    //     if (dstport == 5001) {
+    //         printk(KERN_INFO "[MPTCP ACK] srcport is %d, dstport is %d, saw_mpc is %d, is_mp_join is %d, join_ack is %d", 
+    //         srcport, dstport, mopt.saw_mpc, mopt.is_mp_join, mopt.join_ack);
+    //     }
+    //     #endif
 
-        virtopia_proc_data_ack(skb, nh, tcp);
-    }
+    //     virtopia_proc_data_ack(skb, nh, tcp);
+    // }
 
 }
-
-void virtopia_proc_data(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp) 
-{
-    u32 srcip;
-    u32 dstip;
-    u16 srcport;
-    u16 dstport;
-    u64 tcp_key64;
-
-    srcip = ntohl(nh->saddr);
-    dstip = ntohl(nh->daddr);
-    srcport = ntohs(tcp->source);
-    dstport = ntohs(tcp->dest);
-
-    struct rcv_ack *new_entry;
-    new_entry = NULL;
-    tcp_key64 = get_tcp_key64(dstip, srcip, dstport, srcport);
-}
-
-
 
 void virtopia_proc_data_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp) 
 {
@@ -328,46 +308,48 @@ void virtopia_proc_data_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr
     u32 acked = 0;
     rcu_read_lock();
     ack_entry = rcv_ack_hashtbl_lookup(tcp_key64);
-    if (likely(ack_entry)) {
-        spin_lock(&ack_entry->lock);
-        if (before(ntohl(tcp->ack_seq), ack_entry->snd_una)) {
-            printk(KERN_INFO "STALE ACKS FOUND");
-        }
-        acked = ntohl(tcp->ack_seq) - ack_entry->snd_una;
-        ack_entry->snd_una = ntohl(tcp->ack_seq);
-        /*theory behind: When a TCP sender receives 3 duplicate acknowledgements
-         * for the same piece of data (i.e. 4 ACKs for the same segment,
-         * which is not the most recently sent piece of data), then most likely,
-         * packet was lost in the netowrk. DUP-ACK is faster than RTO*/
-        if (acked == 0 && before(ack_entry->snd_una, ack_entry->snd_nxt) && (tcp_data_len == 0)
-            && ack_entry->prior_real_rcv_wnd == ntohs(tcp->window)){
-                ack_entry->dupack_cnt++;
-        }
-        ack_entry->prior_real_rcv_wnd = ntohs(tcp->window);
+    rcu_read_unlock();
+    // if (likely(ack_entry)) {
+    //     spin_lock(&ack_entry->lock);
+    //     if (before(ntohl(tcp->ack_seq), ack_entry->snd_una)) {
+    //         printk(KERN_INFO "STALE ACKS FOUND");
+    //     }
+    //     acked = ntohl(tcp->ack_seq) - ack_entry->snd_una;
+    //     ack_entry->snd_una = ntohl(tcp->ack_seq);
+    //     /*theory behind: When a TCP sender receives 3 duplicate acknowledgements
+    //      * for the same piece of data (i.e. 4 ACKs for the same segment,
+    //      * which is not the most recently sent piece of data), then most likely,
+    //      * packet was lost in the netowrk. DUP-ACK is faster than RTO*/
+    //     if (acked == 0 && before(ack_entry->snd_una, ack_entry->snd_nxt) && (tcp_data_len == 0)
+    //         && ack_entry->prior_real_rcv_wnd == ntohs(tcp->window)){
+    //             ack_entry->dupack_cnt++;
+    //     }
+    //     ack_entry->prior_real_rcv_wnd = ntohs(tcp->window);
 
-        unsigned long reduced_win;
-        reduced_win = ((unsigned long)ack_entry->rwnd) >> 10U;
-        ack_entry->rwnd = max(RWND_MIN, (unsigned int)reduced_win);
-        printk(KERN_INFO "current RWND is:%u.\n", ack_entry->rwnd);
+    //     //ovs_tcp_reno_cong_avoid(ack_entry, acked);
 
-        //peer subflow modification
-        struct rcv_ack *peer_ack_entry;
-        peer_ack_entry = NULL;
-        rcu_read_lock();
-        peer_ack_entry = rcv_ack_hashtbl_lookup(ack_entry->peer_subflow_key);
-        if(peer_ack_entry) {
-            peer_ack_entry->rwnd = max(RWND_MIN, (unsigned int)reduced_win);
-        }
-        peer_ack_entry = NULL;
-        //Execute
-        if ((ntohs(tcp->window) << ack_entry->snd_wscale) > ack_entry -> rwnd) {
-            u16 enforce_win = ack_entry->rwnd >> ack_entry->snd_wscale;
-            tcp->window = htons(enforce_win);
-        }
-        spin_unlock(&ack_entry->lock);
-    }//finish likely(ack_entry)
+    //     printk(KERN_INFO "current RWND is:%u.\n", ack_entry->rwnd);
+
+    //     //peer subflow modification
+    //     struct rcv_ack *peer_ack_entry;
+    //     peer_ack_entry = NULL;
+    //     rcu_read_lock();
+    //     peer_ack_entry = rcv_ack_hashtbl_lookup(ack_entry->peer_subflow_key);
+    //     rcu_read_unlock();
+    //     if(peer_ack_entry) {
+    //         peer_ack_entry->rwnd = max(RWND_MIN, ack_entry->rwnd);
+    //     }
+    //     peer_ack_entry = NULL;
+    //     //Execute
+
+    //      if ((ntohs(tcp->window) << ack_entry->snd_wscale) > ack_entry->rwnd) {
+    //          u16 enforce_win = ack_entry->rwnd >> ack_entry->snd_wscale;
+    //          tcp->window = htons(enforce_win);
+    //      }
+        
+    //     spin_unlock(&ack_entry->lock);
+    // }//finish likely(ack_entry)
     ack_entry = NULL;
-    rcu_read_unlock();   
 }
 
 
