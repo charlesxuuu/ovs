@@ -315,18 +315,17 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
             srcport = ntohs(tcp->source);
             dstport = ntohs(tcp->dest);
 
+            // Note: in src dst should be different direction
+
             if (ovs_out_packet(skb)) {
-
             	ipv4_change_dsfield(nh, 0, 2);
-
                 if (unlikely(tcp->syn && !tcp->ack)) {
                     virtopia_out_syn(skb, nh, tcp);
                 }
-
                 if (unlikely(tcp->fin)) {
+                	//TODO: Delete token table
                     virtopia_out_fin(skb, nh, tcp);
                 }
-
                 if (likely(tcp->ack)) {
                     virtopia_out_ack(skb, nh, tcp);
                 }
@@ -335,11 +334,18 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
                 }
             } else { // incoming packet
             	if (unlikely(tcp->syn && !tcp->ack)) {
-            	//	virtopia_in_syn(skb, nh, tcp);
+            		virtopia_in_syn(skb, nh, tcp);
             	}
-
-
-
+                if (unlikely(tcp->fin)) {
+                    virtopia_in_fin(skb, nh, tcp);
+                }
+                if (likely(tcp->ack)) {
+                    virtopia_in_ack(skb, nh, tcp);
+                }
+                if (likely(!(tcp->syn || tcp->ack || tcp->rst))) {
+                	virtopia_in_data(skb, nh, tcp);
+                }
+                ipv4_change_dsfield(nh, 0, 0);
             }
         }
     }

@@ -524,6 +524,9 @@ This should be handled in production code
 */
 
 static u8 ovs_tcp_parse_options(const struct sk_buff *skb) {
+    
+    //get snd_wscale from skb
+    
     u8 snd_wscale = 0;
 
     const unsigned char *ptr;
@@ -567,7 +570,9 @@ static u8 ovs_tcp_parse_options(const struct sk_buff *skb) {
     return snd_wscale;
 }
 
+void virtopia_init_rcv_ack(struct rcv_ack *new_entry, struct tcphdr *tcp, int direction);
 
+void virtopia_init_rcv_data(struct rcv_ack *new_entry, struct tcphdr *tcp);
 
 
 void virtopia_out_syn(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
@@ -579,3 +584,14 @@ void virtopia_out_data_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr 
 void virtopia_out_data(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
 
 void virtopia_out_fin(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
+
+
+void virtopia_in_syn(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
+
+void virtopia_in_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
+
+void virtopia_in_data_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
+
+void virtopia_in_data(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
+
+void virtopia_in_fin(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
