@@ -19,6 +19,7 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include "virtopia.h"
+#include "vcc_dctcp.h"
 
 
 #define MSS_DEFAULT (1500U - 14U - 20U -20U)  //in bytes
@@ -203,7 +204,8 @@ void virtopia_in_syn(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp)
     struct rcv_data *data_entry;
     data_entry = NULL;
 
-    tcp_key64 = get_tcp_key64(srcip, dstip, srcport, dstport); // incoming srcip dstip srcport dstport
+
+    tcp_key64 = get_tcp_key64(dstip, srcip, dstport, srcport); 
 
     rcu_read_lock();
     ack_entry = rcv_ack_hashtbl_lookup(tcp_key64);
@@ -232,65 +234,6 @@ void virtopia_in_syn(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp)
     virtopia_init_rcv_data(data_entry, tcp);
     spin_lock_init(&data_entry->lock);
 
-
-    // receiver side does not need associations
-
-    // struct mptcp_options_received mopt;
-    // mptcp_init_mp_opt(&mopt);
-    // tcp_parse_mptcp_options(skb, &mopt);
-
-    // u64 mptcp_sender_key; 
-    // u64 mptcp_receiver_key;
-    // u32 mptcp_rem_token;
-
-    // mptcp_sender_key = mopt.mptcp_sender_key;
-    // mptcp_receiver_key = mopt.mptcp_receiver_key;
-    // mptcp_rem_token = mopt.mptcp_rem_token;
-
-    // //printk(KERN_INFO "[MPTCP SYN] srcport is %d, dstport is %d, saw_mpc is %d, is_mp_join is %d, join_ack is %d, sender_key is %llu, receiver_key is %llu, token is %u", 
-    // //srcport, dstport, mopt.saw_mpc, mopt.is_mp_join, mopt.join_ack, mopt.mptcp_sender_key, mopt.mptcp_receiver_key, mopt.mptcp_rem_token);
-
-    // //MPTCP_SYN_INIT
-    // if (mopt.saw_mpc == 1 && mopt.is_mp_join == 0 && mopt.join_ack == 0) {
-    //     #ifdef IPERF_DEBUG
-    //     if (dstport == 5001) { //iperf test
-    //         //printk(KERN_INFO "[MPTCP SYN] MPTCP_SYN_INIT, mptcp_sender_key is %llu", mptcp_sender_key);
-    //         printk(KERN_INFO "[MPTCP SYN] MPTCP_SYN_INIT srcport is %d, dstport is %d, saw_mpc is %d, is_mp_join is %d, join_ack is %d, sender_key is %llu", 
-    //         srcport, dstport, mopt.saw_mpc, mopt.is_mp_join, mopt.join_ack, mopt.mptcp_sender_key);
-    //     }
-    //     #endif
-    // }
-
-    // //MPTCP_SYN_JOIN
-    // if (mopt.saw_mpc == 1 && mopt.is_mp_join == 1 && mopt.join_ack == 0) {
-    //     #ifdef IPERF_DEBUG
-    //     if (dstport == 5001) { //iperf test
-    //         //printk(KERN_INFO "[MPTCP SYN] MPTCP_SYN_JOIN, srcport is %d, dstport is %d, mptcp_rem_token is %u", srcport, dstport, mptcp_rem_token);
-    //         printk(KERN_INFO "[MPTCP SYN] MPTCP_SYN_JOIN, srcport is %d, dstport is %d, saw_mpc is %d, is_mp_join is %d, join_ack is %d, sender_key is %llu", 
-    //         srcport, dstport, mopt.saw_mpc, mopt.is_mp_join, mopt.join_ack, mopt.mptcp_sender_key);
-    //     }
-    //     #endif
-
-    //     rcu_read_lock();  
-    //     struct token_key *existing_token_key;
-    //     existing_token_key = NULL;
-    //     existing_token_key = token_key_hashtbl_lookup(mptcp_rem_token);
-    //     rcu_read_unlock();
-
-    //     if(existing_token_key) {
-    //         struct rcv_ack *master_subflow_ack_entry = NULL;
-    //         master_subflow_ack_entry = rcv_ack_hashtbl_lookup(existing_token_key->key);
-    //         //key association
-    //         if (master_subflow_ack_entry) {
-    //             //not now, full mesh will try all possible pairs
-    //             //master_subflow_ack_entry->peer_subflow_key = tcp_key64; 
-    //             ack_entry->peer_subflow_key = master_subflow_ack_entry->key;
-    //         }
-    //         master_subflow_ack_entry = NULL;
-    //     }
-    //     existing_token_key = NULL;
-    // }
-    // ack_entry = NULL;
 }
 
 
@@ -417,7 +360,7 @@ void virtopia_out_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp)
 
 void virtopia_out_data_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp) 
 {
-    
+    // Pack ECN Info and clear ECN info
     u32 srcip;
     u32 dstip;
     u16 srcport;
@@ -428,13 +371,28 @@ void virtopia_out_data_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr 
     dstip = ntohl(nh->daddr);
     srcport = ntohs(tcp->source);
     dstport = ntohs(tcp->dest);
+
+    struct rcv_data *data_entry;
+    data_entry = NULL;
+    tcp_key64 = get_tcp_key64(dstip, srcip, dstport, srcport); //direction
+    rcu_read_lock();
+    data_entry = rcv_data_hashtbl_lookup(tcp_key64);
+    rcu_read_unlock();
+    if (likely(data_entry)) {
+        vcc_pack_ecn_info(skb, data_entry->ecn_bytes_per_ack, data_entry->total_bytes_per_ack);
+        spin_lock(&data_entry->lock);
+        data_entry->total_bytes_per_ack = 0 ;
+        data_entry->ecn_bytes_per_ack = 0;
+        spin_unlock(&data_entry->lock);
+    }
+    data_entry = NULL;
 }
 
 
 
 void virtopia_in_data_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp) 
 {
-    // Do congestion control
+    // ToDo congestion control
 
     u32 srcip;
     u32 dstip;
@@ -452,7 +410,8 @@ void virtopia_in_data_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *
 
     struct rcv_ack *ack_entry;
     ack_entry = NULL;
-    tcp_key64 = get_tcp_key64(dstip, srcip, dstport, srcport);
+    tcp_key64 = get_tcp_key64(srcip, dstip, srcport, dstport);
+
     u32 acked = 0;
     rcu_read_lock();
     ack_entry = rcv_ack_hashtbl_lookup(tcp_key64);
@@ -473,16 +432,23 @@ void virtopia_in_data_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *
         }
         ack_entry->prior_real_rcv_wnd = ntohs(tcp->window);
 
+
+        vcc_unpack_ecn_info(skb, ack_entry->ecn_bytes, ack_entry->total_bytes);
+        vcc_dctcp_update_alpha(ack_entry);
+
         unsigned long reduced_win;
-        reduced_win = ((unsigned long)ack_entry->rwnd) >> 2U;
+        reduced_win = ((unsigned long)vcc_dctcp_ssthresh(ack_entry));
+
         ack_entry->rwnd = max(RWND_MIN, (unsigned int)reduced_win);
         printk(KERN_INFO "current RWND is:%u.\n", ack_entry->rwnd);
+        spin_unlock(&ack_entry->lock);
 
         //peer subflow modification
         struct rcv_ack *peer_ack_entry;
         peer_ack_entry = NULL;
         rcu_read_lock();
         peer_ack_entry = rcv_ack_hashtbl_lookup(ack_entry->peer_subflow_key);
+        rcu_read_unlock();
         if(peer_ack_entry) {
             peer_ack_entry->rwnd = max(RWND_MIN, (unsigned int)reduced_win);
         }
@@ -492,7 +458,6 @@ void virtopia_in_data_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *
             u16 enforce_win = ack_entry->rwnd >> ack_entry->snd_wscale;
             tcp->window = htons(enforce_win);
         }
-        spin_unlock(&ack_entry->lock);
     }//finish likely(ack_entry)
     ack_entry = NULL;
     rcu_read_unlock();   
@@ -502,82 +467,14 @@ void virtopia_in_data_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *
 
 void virtopia_in_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp) {
 
-    // do congestion control
-    
-    u32 srcip;
-    u32 dstip;
-    u16 srcport;
-    u16 dstport;
-    u64 tcp_key64;
-
-    srcip = ntohl(nh->saddr);
-    dstip = ntohl(nh->daddr);
-    srcport = ntohs(tcp->source);
-    dstport = ntohs(tcp->dest);
-
-    struct rcv_ack *ack_entry;
-    ack_entry = NULL;
-    u32 acked = 0;
-
-
-    tcp_key64 = get_tcp_key64(dstip, srcip, dstport, srcport);
-
-    rcu_read_lock();
-    ack_entry = rcv_ack_hashtbl_lookup(tcp_key64);
-    rcu_read_unlock();
-
-    if (likely(ack_entry)) {
-        spin_lock(&ack_entry->lock);
-        if (before(ntohl(tcp->ack_seq), ack_entry->snd_una)) {
-            printk("[MPTCP STALE ACK]\n");
-        }
-
-        acked = ntohl(tcp->ack_seq) - ack_entry->snd_una;
-        ack_entry->snd_una = ntohl(tcp->ack_seq);
-        /*theory behind: When a TCP sender receives 3 duplicate acknowledgements
-        * for the same piece of data (i.e. 4 ACKs for the same segment,
-        * which is not the most recently sent piece of data), then most likely,
-        * packet was lost in the netowrk. DUP-ACK is faster than RTO*/
-
-        if (acked == 0 && before(ack_entry->snd_una, ack_entry->snd_nxt) && (tcp_data_len == 0)
-            && ack_entry->prior_real_rcv_wnd == ntohs(tcp->window)) {
-                ack_entry->dupack_cnt++;
-        }
-        ack_entry->prior_real_rcv_wnd = ntohs(tcp->window);
-
-        //logic unpack ecn info?
-        //update_alpha
-
-        vcc_dctcp_update_alpha(ack_entry);
-
-        if () {
-            ovs_tcp_reno_cong_avoid(ack_entry, acked);
-        } else if () {
-            unsigned long reduced_win;
-            reduced_win = ((unsigned long)ack_entry->rwnd*(1024U*1024U-TIMELY_BETA*normalized_gradient)) >> 20U;
-            ack_entry->rwnd = max(RWND_MIN, (unsigned int)reduced_win);
-
-            //peer subflow modification
-            struct rcv_ack *peer_ack_entry;
-            peer_ack_entry = NULL;
-            rcu_read_lock();
-            peer_ack_entry = rcv_ack_hashtbl_lookup(ack_entry->peer_subflow_key);
-            if(peer_ack_entry) {
-                peer_ack_entry->rwnd = max(RWND_MIN, (unsigned int)reduced_win);
-            }
-            peer_ack_entry = NULL;
-        }
-
-        printk(KERN_INFO "current RWND is:%u.\n", ack_entry->rwnd);
-        
-
-        //excution
-        if ((ntohs(tcp->window) << ack_entry->snd_wscale) > ack_entry->rwnd) {
-            //modify receiver window at the receivers ovs
-            u16 enforce_win = ack_entry->rwnd >> ack_entry->snd_wscale;
-            tcp->window = htons(enforce_win);
-        }
-        spin_unlock(&ack_entry->lock);
+    if (mopt.saw_mpc == 0 && mopt.is_mp_join == 0 && mopt.join_ack == 0) {
+         #ifdef IPERF_DEBUG
+         if (dstport == 5001) {
+             printk(KERN_INFO "[MPTCP ACK] srcport is %d, dstport is %d, saw_mpc is %d, is_mp_join is %d, join_ack is %d", 
+             srcport, dstport, mopt.saw_mpc, mopt.is_mp_join, mopt.join_ack);
+         }
+         #endif
+         virtopia_in_data_ack(skb, nh, tcp);
     }
 }
 
