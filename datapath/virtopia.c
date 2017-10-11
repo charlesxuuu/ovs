@@ -19,20 +19,26 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include "virtopia.h"
-#include "vcc_dctcp.h"
 
 
 #define MSS_DEFAULT (1500U - 14U - 20U -20U)  //in bytes
+ 
 static unsigned int MSS = MSS_DEFAULT;
 module_param(MSS, uint, 0644);
 MODULE_PARM_DESC(MSS, "An unsigned int to initlize the MSS");
 
+static unsigned int dctcp_shift_g __read_mostly = 4; /* g = 1/2^4 */
+module_param(dctcp_shift_g, uint, 0644);
+MODULE_PARM_DESC(dctcp_shift_g, "parameter g for updating dctcp_alpha");
 
 #define RWND_INIT 10U*MSS
 #define RWND_CLAMP (10*1000*1000*4/8) //4 means the maximal latency expected (4 msec), in bytes
 #define RWND_MIN MSS
+#define RWND_STEP MSS
 #define RWND_SSTHRESH_INIT (RWND_CLAMP >> 1)
+
 #define DCTCP_ALPHA_INIT 1024U
+#define DCTCP_MAX_ALPHA  1024U
 
 #define OUT 0
 #define IN 1
@@ -40,6 +46,21 @@ MODULE_PARM_DESC(MSS, "An unsigned int to initlize the MSS");
 #define IPERF_DEBUG 1
 
 
+enum {
+    OVS_PKT_IN = 1U, //packets come to the host
+    OVS_PKT_OUT = 3U, //packets go to the network (switch), see "ip_summed_*"
+};
+
+enum {
+    OVS_ECN_MASK = 3U,
+    OVS_ECN_ZERO = 0U,
+    OVS_ECN_ONE = 1U,
+    OVS_ECN_FAKE = 4U, //set the second highest bit of 3 reserved bits in TCP header
+    OVS_ECN_FAKE_CLEAR = 11U, // 1011 (binary) = 11 (decimal)
+    OVS_ACK_SPEC_SET = 8U, //set the highest bit of 3 reserved bits in TCP header
+    OVS_ACK_PACK_SET = 2U, //set the third highest bit of 3 reserved bits in TCP header
+    OVS_ACK_PACK_CLEAR = 13U, // 1101 (binary) = 13 (decimal)
+};
 
 /* test function for virtopia */
 
@@ -55,7 +76,8 @@ void virtopia_extern_test(void)
 	printk("virtopia_extern_test");
 } 
 
-void virtopia_init_rcv_ack(struct rcv_ack *new_entry, struct tcphdr *tcp, int direction) 
+
+void virtopia_init_rcv_ack(struct rcv_ack *new_entry, struct tcphdr *tcp, int direction, struct sk_buff *skb) 
 {
     if (direction == OUT) {
         new_entry->rwnd = RWND_INIT;
@@ -120,7 +142,7 @@ void virtopia_out_syn(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp)
         rcv_ack_hashtbl_insert(tcp_key64, new_entry);
     }
 
-    virtopia_init_rcv_ack(new_entry, tcp, OUT);
+    virtopia_init_rcv_ack(new_entry, tcp, OUT, skb);
     spin_lock_init(&new_entry->lock);
 
 
@@ -221,7 +243,7 @@ void virtopia_in_syn(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp)
         rcv_ack_hashtbl_insert(tcp_key64, ack_entry);
     }
 
-    virtopia_init_rcv_ack(ack_entry, tcp, IN);
+    virtopia_init_rcv_ack(ack_entry, tcp, IN, skb);
     spin_lock_init(&ack_entry->lock);
 
 
@@ -392,7 +414,7 @@ void virtopia_out_data_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr 
 
 void virtopia_in_data_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp) 
 {
-    // ToDo congestion control
+
 
     u32 srcip;
     u32 dstip;
@@ -467,6 +489,30 @@ void virtopia_in_data_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *
 
 void virtopia_in_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp) {
 
+    u32 srcip;
+    u32 dstip;
+    u16 srcport;
+    u16 dstport;
+    u64 tcp_key64;
+
+    srcip = ntohl(nh->saddr);
+    dstip = ntohl(nh->daddr);
+    srcport = ntohs(tcp->source);
+    dstport = ntohs(tcp->dest);
+
+    u64 mptcp_sender_key; 
+    u64 mptcp_receiver_key;
+    u32 mptcp_calc_token;
+
+
+    struct mptcp_options_received mopt;
+    mptcp_init_mp_opt(&mopt);
+    tcp_parse_mptcp_options(skb, &mopt);
+
+    mptcp_sender_key = mopt.mptcp_sender_key;
+    mptcp_receiver_key = mopt.mptcp_receiver_key;
+    mptcp_calc_token = 0;
+
     if (mopt.saw_mpc == 0 && mopt.is_mp_join == 0 && mopt.join_ack == 0) {
          #ifdef IPERF_DEBUG
          if (dstport == 5001) {
@@ -509,8 +555,8 @@ void virtopia_out_data(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp
     ack_entry = rcv_ack_hashtbl_lookup(tcp_key64);
     if (likely(ack_entry)) {
         spin_lock(&ack_entry->lock);
-        if (tcp_data_len > 0 && after(end_seq, the_entry->snd_nxt)) {
-            the_entry->snd_nxt = end_seq;
+        if (tcp_data_len > 0 && after(end_seq, ack_entry->snd_nxt)) {
+            ack_entry->snd_nxt = end_seq;
             /*printk(KERN_INFO "tcp_data_len:%d, snd_nxt updated: %u (%d --> %d)\n",
                 tcp_data_len, end_seq, srcport, dstport);
             */
@@ -592,7 +638,7 @@ void virtopia_out_fin(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp)
             #endif
         }
         existing_token_key = NULL;
-        rcv_ack_hashtbl_delete(new_entry);
+        rcv_ack_hashtbl_delete(existing_entry);
         #ifdef IPERF_DEBUG
         if (dstport == 5001) {
             printk(KERN_INFO "rcv_ack_hashtbl entry deleted. %d --> %d\n",
@@ -669,3 +715,223 @@ void virtopia_in_fin(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp) 
     existing_data = NULL;
 }
 
+
+
+
+
+void vcc_tcp_slow_start(struct rcv_ack *rack, u32 acked) {
+//”acked” means the number of bytes acked by an ACK
+    u32 rwnd = rack->rwnd + acked;
+
+    if (rwnd > rack->rwnd_ssthresh)
+        rwnd = rack->rwnd_ssthresh + RWND_STEP;
+
+    rack->rwnd = min(rwnd, rack->rwnd_clamp);
+}
+
+/* In theory this is tp->snd_cwnd += 1 / tp->snd_cwnd (or alternative w) */
+/* In theory this is tp->rwnd += MSS / tp->rwnd (or alternative w) */
+void vcc_tcp_cong_avoid_ai(struct rcv_ack *rack, u32 w, u32 acked) {
+    if (rack->snd_rwnd_cnt >= w) {
+        if (rack->rwnd < rack->rwnd_clamp)
+            rack->rwnd += RWND_STEP;
+        rack->snd_rwnd_cnt = 0;
+    } else {
+        rack->snd_rwnd_cnt += acked;
+    }
+
+    rack->rwnd = min(rack->rwnd, rack->rwnd_clamp);
+}
+
+/*
+* TCP Reno congestion control
+* This is special case used for fallback as well.
+*/
+/* This is Jacobson's slow start and congestion avoidance.
+* SIGCOMM '88, p. 328.
+*/
+void vcc_tcp_reno_cong_avoid(struct rcv_ack *rack, u32 acked) {
+    /* In "safe" area, increase. */
+    if (rack->rwnd <= rack->rwnd_ssthresh)
+        vcc_tcp_slow_start(rack, acked);
+    /* In dangerous area, increase slowly. */
+    else
+        vcc_tcp_cong_avoid_ai(rack, rack->rwnd, acked);
+}
+
+/* Slow start threshold is half the congestion window (min 2) */
+u32 vcc_tcp_reno_ssthresh(struct rcv_ack *rack) {
+    return max(rack->rwnd >> 1U, 2U);
+}
+
+void vcc_dctcp_reset(struct rcv_ack *rack) {
+    rack->next_seq = rack->snd_nxt;
+
+    rack->ecn_bytes = 0;
+    rack->total_bytes = 0;
+
+    rack->reduced_this_win = false;
+    rack->loss_detected_this_win = false;
+}
+
+u32 vcc_dctcp_ssthresh(struct rcv_ack *rack) {
+    //cwnd = cwnd* (1 - alpha/2)
+    //rwnd = rwnd* (1 - alpha/2)
+    return max(rack->rwnd - ((rack->rwnd * rack->alpha) >> 11U), RWND_MIN);
+
+}
+
+void vcc_dctcp_update_alpha(struct rcv_ack *rack) {
+    /* Expired RTT */
+    /* update alpha once per window of data, roughly once per RTT
+     * rack->total_bytes should be larger than 0
+     */
+    if (!before(rack->snd_una, rack->next_seq)) {
+
+        /*printk(KERN_INFO "ecn_bytes:%u, total_bytes:%u, alpha:%u, snd_una:%u, next_seq:%u, snd_nxt:%u \n",
+                *         rack->ecn_bytes, rack->total_bytes, rack->alpha, rack->snd_una, rack->next_seq, rack->snd_nxt);
+        */
+        /* keep alpha the same if total_bytes is zero */
+        if (rack->total_bytes > 0) {
+
+            if (rack->ecn_bytes > rack->total_bytes)
+                rack->ecn_bytes = rack->total_bytes;
+
+            /* alpha = (1 - g) * alpha + g * F */
+            rack->alpha = rack->alpha -
+                          (rack->alpha >> dctcp_shift_g) +
+                          (rack->ecn_bytes << (10U - dctcp_shift_g)) /
+                          rack->total_bytes;
+            if (rack->alpha > DCTCP_MAX_ALPHA)
+                rack->alpha = DCTCP_MAX_ALPHA;
+        }
+
+        vcc_dctcp_reset(rack);
+        /*printk(KERN_INFO "ecn_bytes:%u, total_bytes:%u, alpha:%u\n",
+                        rack->ecn_bytes, rack->total_bytes, rack->alpha);
+        */
+
+    }
+}
+
+bool vcc_may_raise_rwnd(struct rcv_ack *rack) {
+    /*return ture if there is no ECN feedback received in this window yet &&
+    * no packet loss is detected in this window yet
+    */
+    if (rack->ecn_bytes > 0 || rack->loss_detected_this_win == true)
+        return false;
+    else
+        return true;
+}
+
+bool vcc_may_reduce_rwnd(struct rcv_ack *rack) {
+    if (rack->reduced_this_win == false)
+        return true;
+    else
+        return false;
+}
+
+int vcc_pack_ecn_info(struct sk_buff *skb, u32 ecn_bytes, u32 total_bytes) {
+    struct iphdr *nh;
+    struct tcphdr *tcp;
+
+    u16 header_len;
+    u16 old_total_len;
+    u16 old_tcp_len;
+
+    u8 ECN_INFO_LEN = 8;
+    /*the caller makes sure this is a TCP packet*/
+    nh = ip_hdr(skb);
+    tcp = tcp_hdr(skb);
+
+    header_len = skb->mac_len + (nh->ihl << 2) + 20;
+    old_total_len = ntohs(nh->tot_len);
+    old_tcp_len = tcp->doff << 2;
+
+    if (skb_cow_head(skb, ECN_INFO_LEN) < 0)
+        return -ENOMEM;
+
+    skb_push(skb, ECN_INFO_LEN);
+    memmove(skb_mac_header(skb) - ECN_INFO_LEN, skb_mac_header(skb), header_len);
+    skb_reset_mac_header(skb);
+    skb_set_network_header(skb, skb->mac_len);
+    skb_set_transport_header(skb, skb->mac_len + (ip_hdr(skb)->ihl << 2));
+
+    ecn_bytes = htonl(ecn_bytes);
+    total_bytes = htonl(total_bytes);
+    memcpy(skb_mac_header(skb) + header_len, &ecn_bytes, (ECN_INFO_LEN >> 1));
+    memcpy(skb_mac_header(skb) + header_len + (ECN_INFO_LEN >> 1), &total_bytes, (ECN_INFO_LEN >> 1));
+    /*we believe that the NIC will re-calculate checksums for us*/
+    nh = ip_hdr(skb);
+    tcp = tcp_hdr(skb);
+
+    nh->tot_len = htons(old_total_len + ECN_INFO_LEN);
+    tcp->doff = ((old_tcp_len + ECN_INFO_LEN) >> 2);
+    /*printk("before maring pack, tcp->src:%u, tcp->dst:%u, tcp->res1:%u\n",
+    * ntohs(tcp->source), ntohs(tcp->dest), tcp->res1);
+    */
+    tcp->res1 |= OVS_ACK_PACK_SET;
+    /*printk("before maring pack, tcp->src:%u, tcp->dst:%u, tcp->res1:%u\n",
+    * ntohs(tcp->source), ntohs(tcp->dest), tcp->res1);
+    */
+    return 0;
+}
+
+/*note, after this unpack function, tcp and ip points should be refreshed*/
+int vcc_unpack_ecn_info(struct sk_buff *skb, u32 *this_ecn, u32 *this_total) {
+    struct iphdr *nh;
+    struct tcphdr *tcp;
+
+    u16 header_len;
+    u16 old_total_len;
+    u16 old_tcp_len;
+    int err;
+
+    u8 ECN_INFO_LEN = 8;
+    /*the caller makes sure this is a TCP packet*/
+    nh = ip_hdr(skb);
+    tcp = tcp_hdr(skb);
+
+    header_len = skb->mac_len + (nh->ihl << 2) + 20;
+    old_total_len = ntohs(nh->tot_len);
+    old_tcp_len = tcp->doff << 2;
+
+    err = skb_ensure_writable(skb, header_len);
+    if (unlikely(err))
+        return err;
+
+    memset(this_ecn, 0, sizeof(*this_ecn));
+    memset(this_total, 0, sizeof(*this_total));
+
+    memcpy(this_ecn, skb_mac_header(skb) + header_len, (ECN_INFO_LEN >> 1));
+    memcpy(this_total, skb_mac_header(skb) + header_len + (ECN_INFO_LEN >> 1), (ECN_INFO_LEN >> 1));
+
+    *this_ecn = ntohl(*this_ecn);
+    *this_total = ntohl(*this_total);
+
+    //printk("we are unpack (check ip_summed):%u, ip_fast_csum:%u\n", skb->ip_summed, ip_fast_csum((u8 *)nh, nh->ihl));
+    skb_postpull_rcsum(skb, skb_mac_header(skb) + header_len, ECN_INFO_LEN);
+
+    memmove(skb_mac_header(skb) + ECN_INFO_LEN, skb_mac_header(skb), header_len);
+    __skb_pull(skb, ECN_INFO_LEN);
+    skb_reset_mac_header(skb);
+    skb_set_network_header(skb, skb->mac_len);
+    skb_set_transport_header(skb, skb->mac_len + (ip_hdr(skb)->ihl << 2));
+
+    nh = ip_hdr(skb);
+    tcp = tcp_hdr(skb);
+
+    /*printk("we are unpack (before), tcp->src:%u, tcp->dst:%u, tcp->seq:%u, tcp->ack_seq:%u, tcp->res1:%u, nh->tot_len:%u, tcp->doff:%u, this_ecn:%u, this_total:%u, skb->ip_summed:%u\n",
+        * ntohs(tcp->source), ntohs(tcp->dest), ntohl(tcp->seq), ntohl(tcp->ack_seq), tcp->res1, ntohs(nh->tot_len), tcp->doff, *this_ecn, *this_total, skb->ip_summed);
+    */
+    nh->tot_len = htons(old_total_len - ECN_INFO_LEN);
+    csum_replace2(&nh->check, htons(old_total_len), nh->tot_len);
+
+    tcp->doff = ((old_tcp_len - ECN_INFO_LEN) >> 2);
+    tcp->res1 &= OVS_ACK_PACK_CLEAR;
+
+    /*printk("we are unpack (after), tcp->src:%u, tcp->dst:%u, tcp->seq:%u, tcp->ack_seq:%u, tcp->res1:%u, nh->tot_len:%u, tcp->doff:%u, this_ecn:%u, this_total:%u, skb->ip_summed:%u, ip_fast_csum:%u\n",
+        * ntohs(tcp->source), ntohs(tcp->dest), ntohl(tcp->seq), ntohl(tcp->ack_seq), tcp->res1, ntohs(nh->tot_len), tcp->doff, *this_ecn, *this_total, skb->ip_summed, ip_fast_csum((u8 *)nh, nh->ihl));
+    */
+    return 0;
+}

@@ -28,29 +28,6 @@
 #include <net/tcp.h>  //must be MPTCP Linux kernel
 
 
-
-/* MPTCP Kernel required */
-extern void tcp_parse_mptcp_options(const struct sk_buff *skb,
-                 struct mptcp_options_received *mopt);
-extern void mptcp_key_sha1(u64 key, u32 *token, u64 *idsn);
-
-
-/* Hashtable lock */
-static DEFINE_SPINLOCK(datalock);
-static DEFINE_SPINLOCK(acklock);
-static DEFINE_SPINLOCK(tokenlock);
-
-/*TODO for production code, use resizable hashtable
-A technique related to IBM, https://lwn.net/Articles/612021/
-*/
-/* Hashtable */
-#define TBL_SIZE 15U
-static DEFINE_HASHTABLE(rcv_data_hashtbl, TBL_SIZE);
-static DEFINE_HASHTABLE(rcv_ack_hashtbl, TBL_SIZE);
-static DEFINE_HASHTABLE(token_key_hashtbl, TBL_SIZE);
-
-#define VIF_NAME "tap*"
-
 struct rcv_data {
     u64 key; //key of a flow, {LOW16(srcip), LOW16(dstip), tcpsrc, tcpdst}
     u32 ecn_bytes_per_ack; //32 bit should be sufficient
@@ -101,10 +78,33 @@ struct token_key {
 
 
 
+/* MPTCP Kernel required */
+extern void tcp_parse_mptcp_options(const struct sk_buff *skb,
+                 struct mptcp_options_received *mopt);
+extern void mptcp_key_sha1(u64 key, u32 *token, u64 *idsn);
+
+
+/* Hashtable lock */
+static DEFINE_SPINLOCK(datalock);
+static DEFINE_SPINLOCK(acklock);
+static DEFINE_SPINLOCK(tokenlock);
+
+
+/*TODO for production code, use resizable hashtable
+A technique related to IBM, https://lwn.net/Articles/612021/
+*/
+/* Hashtable */
+#define TBL_SIZE 15U
+static DEFINE_HASHTABLE(rcv_data_hashtbl, TBL_SIZE);
+static DEFINE_HASHTABLE(rcv_ack_hashtbl, TBL_SIZE);
+static DEFINE_HASHTABLE(token_key_hashtbl, TBL_SIZE);
+
+#define VIF_NAME "tap*"
+
+
 /* test function for virtopia */
 
 void virtopia_test(void);
-
 
 /* Hashtable usage for virtopia */
 /* rcv_data_hashtbl functions*/
@@ -119,6 +119,7 @@ static u16 ovs_hash_min(u64 key, int size) {
     low32 = low32 >> 16;
     return (low16 + low32) % (1 << size);
 }
+
 
 //insert a new entry
 static void rcv_data_hashtbl_insert(u64 key, struct rcv_data *value)
@@ -179,7 +180,7 @@ static void rcv_data_hashtbl_destroy(void)
 }
 
 /*functions for rcv_ack_hashtbl*/
-//insert a new entru
+//insert a new entry
 static void rcv_ack_hashtbl_insert(u64 key, struct rcv_ack *value)
 {
     u32 bucket_hash;
@@ -570,9 +571,12 @@ static u8 ovs_tcp_parse_options(const struct sk_buff *skb) {
     return snd_wscale;
 }
 
-void virtopia_init_rcv_ack(struct rcv_ack *new_entry, struct tcphdr *tcp, int direction);
 
-void virtopia_init_rcv_data(struct rcv_ack *new_entry, struct tcphdr *tcp);
+
+
+void virtopia_init_rcv_ack(struct rcv_ack *new_entry, struct tcphdr *tcp, int direction, struct sk_buff *skb);
+
+void virtopia_init_rcv_data(struct rcv_data *new_entry, struct tcphdr *tcp);
 
 
 void virtopia_out_syn(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
@@ -595,3 +599,33 @@ void virtopia_in_data_ack(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *
 void virtopia_in_data(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
 
 void virtopia_in_fin(struct sk_buff *skb, struct iphdr *nh, struct tcphdr *tcp);
+
+
+
+
+
+
+
+
+
+void vcc_tcp_slow_start(struct rcv_ack *rack, u32 acked);
+
+void vcc_tcp_cong_avoid_ai(struct rcv_ack *rack, u32 w, u32 acked);
+
+void vcc_tcp_reno_cong_avoid(struct rcv_ack *rack, u32 acked);
+
+u32 vcc_tcp_reno_ssthresh(struct rcv_ack *rack);
+
+void vcc_dctcp_reset(struct rcv_ack *rack);
+
+u32 vcc_dctcp_ssthresh(struct rcv_ack *rack);
+
+void vcc_dctcp_update_alpha(struct rcv_ack *rack);
+
+bool vcc_may_raise_rwnd(struct rcv_ack *rack);
+
+bool vcc_may_reduce_rwnd(struct rcv_ack *rack);
+
+int vcc_pack_ecn_info(struct sk_buff *skb, u32 ecn_bytes, u32 total_bytes);
+
+int vcc_unpack_ecn_info(struct sk_buff *skb, u32 *this_ecn, u32 *this_total);

@@ -273,6 +273,15 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
 	u64 *stats_counter;
 	u32 n_mask_hit;
 
+
+    struct iphdr *nh; 
+    struct tcphdr *tcp; 
+    u32 srcip;
+    u32 dstip;
+    u16 srcport;
+    u16 dstport;
+
+
 	// if (p != NULL)	{
 	// 	if (p->dev != NULL) {
 	// 		printk(KERN_INFO "vport name (p->dev->name) is %s", p->dev->name);
@@ -297,8 +306,6 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
     virtopia_extern_test();
     */
 
-    struct iphdr *nh; 
-    struct tcphdr *tcp; 
     nh = NULL;
     tcp = NULL;
 
@@ -306,10 +313,6 @@ void ovs_dp_process_packet(struct sk_buff *skb, struct sw_flow_key *key)
         nh = ip_hdr(skb);
         if (nh->protocol == IPPROTO_TCP) { // TCP packet
             tcp = tcp_hdr(skb);
-            u32 srcip;
-            u32 dstip;
-            u16 srcport;
-            u16 dstport;
             srcip = ntohl(nh->saddr);
             dstip = ntohl(nh->daddr);
             srcport = ntohs(tcp->source);

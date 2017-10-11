@@ -21,6 +21,8 @@ AC_CONFIG_HEADERS([config.h])
 AC_CONFIG_TESTDIR([tests])
 AM_INIT_AUTOMAKE([tar-pax])
 
+
+
 AC_PROG_CC_C99
 AM_PROG_CC_C_O
 AC_PROG_CXX
@@ -151,8 +153,15 @@ AC_CONFIG_FILES([
     ovn/lib/libovn.sym
     vtep/libvtep.sym])
 
+
+
 OVS_ENABLE_OPTION([-Wall])
 OVS_ENABLE_OPTION([-Wextra])
+
+#chix
+OVS_ENABLE_OPTION([-Wno-declaration-after-statement])
+OVS_ENABLE_OPTION([-Wno-unused-function])
+
 OVS_ENABLE_OPTION([-Wno-sign-compare])
 OVS_ENABLE_OPTION([-Wpointer-arith])
 OVS_ENABLE_OPTION([-Wformat -Wformat-security])
@@ -187,6 +196,7 @@ OVS_CHECK_DPDK
 OVS_CHECK_PRAGMA_MESSAGE
 AC_SUBST([OVS_CFLAGS])
 AC_SUBST([OVS_LDFLAGS])
+
 
 AC_CONFIG_FILES(Makefile)
 AC_CONFIG_FILES(datapath/Makefile)
